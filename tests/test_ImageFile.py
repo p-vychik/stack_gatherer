@@ -1,5 +1,6 @@
 
 import sys
+
  
 # setting path
 sys.path.append('../stack_gatherer')
@@ -32,3 +33,4 @@ def test_params_values():
 def test_same_full_path_is_returned():
     input = r"foo/bar/dataseTPtName_TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150_ffdfs.tif"
     assert input == ImageFile(input).get_file_path()
+

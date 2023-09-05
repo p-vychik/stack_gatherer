@@ -11,6 +11,9 @@ from watchdog.observers import Observer
 import time
 import os
 import re
+import numpy
+from tifffile import imread, imwrite, memmap
+from tqdm import tqdm
 
 active_stacks = {}
 
@@ -94,17 +97,55 @@ class ImageFile:
                 )
     def get_file_path(self):
         return os.path.join(self.path_to_image_dir, self.get_name())
+    def get_stack_signature(self):
+        return (self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera)
 
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 
-def add_file_to_active_stacks(file_path):
-    file_obj = ImageFile(os.path.basename(file_path))
-    stack_signature = ()
+def collect_files_to_one_stack(file_list, output_file_name):
+    sample_image = imread(file_list[0])
+    shape = (len(file_list), sample_image.shape[0], sample_image.shape[1])
+    dtype = sample_image.dtype
 
-def check_if_a_stack_is_ready(file_path):
-    # Replace this with your logic to check if a stack is ready
-    print(f"Checking if stack is ready for file: {file_path}")
+    # create an empty OME-TIFF file
+    imwrite(output_file_name, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
+
+    # memory map numpy array to data in OME-TIFF file
+    zyx_stack = memmap(output_file_name)
+    print(f"Writing stack to {output_file_name}")
+    # write data to memory-mapped array
+    with tqdm(total=len(file_list), desc="Saving plane") as pbar:
+        for t in range(shape[0]):
+            if t == 0:
+                zyx_stack[t] = sample_image
+                zyx_stack.flush()
+                pbar.update(1)
+                continue
+            zyx_stack[t] = imread(file_list[t])
+            zyx_stack.flush()
+            pbar.update(1)
+
+
+
+def add_file_to_active_stacks(file_path):
+    file = ImageFile(file_path)
+    stack_signature = file.get_stack_signature()
+    if stack_signature not in active_stacks:
+        active_stacks[stack_signature] = {}
+        print(f"Adding stack {stack_signature} to active queue.")
+    if file.plane not in active_stacks[stack_signature]:
+        active_stacks[stack_signature][file.plane] = file 
+    return stack_signature
+
+def check_if_a_stack_is_ready(stack_signature):
+    if len(active_stacks[stack_signature]) < stack_signature[0]:
+        return
+    file_list = []
+    for i, _ in enumerate(active_stacks[stack_signature]):
+        # We have to access by index since we can't gurantee that files were added to dict in order of planes
+        file_list.append(active_stacks[stack_signature][i])
+    
 
 # Define the event handler class
 
@@ -115,8 +156,8 @@ class MyHandler(FileSystemEventHandler):
             return
         file_path =  event.src_path
         # Call the function when a new file is created
-        add_file_to_active_stacks(file_path)
-        check_if_a_stack_is_ready(file_path)
+        stack_signature = add_file_to_active_stacks(file_path)
+        check_if_a_stack_is_ready(stack_signature)
 
 
 def main():
