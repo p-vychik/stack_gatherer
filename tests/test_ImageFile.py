@@ -9,6 +9,10 @@ from stack_gatherer import ImageFile
 def test_same_filename_is_returned():
     input = "dataseTPtName_TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150_ffdfs.tif"
     assert input == ImageFile(input).get_name()
+    input = "dataseTPtName_TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150.tif"
+    assert input == ImageFile(input).get_name()
+    input = "TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150.tif"
+    assert input == ImageFile(input).get_name()
 
 def test_same_filename_withot_extension_is_returned():
     input = "dataseTPtName_TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150_ffdfs.tif"

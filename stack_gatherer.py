@@ -61,7 +61,7 @@ class ImageFile:
                 elif i == 7:
                     name_and_info = name_part.strip("-_").split("_", 1)
                     if len(name_and_info) == 1:
-                        self.total_num_planes = int(name_and_info.strip("-_"))
+                        self.total_num_planes = int(name_and_info[0].strip("-_"))
                     else:
                         num_planes, info = name_and_info
                         self.total_num_planes = int(num_planes.strip("-_"))
@@ -159,24 +159,16 @@ class MyHandler(FileSystemEventHandler):
         stack_signature = add_file_to_active_stacks(file_path)
         check_if_a_stack_is_ready(stack_signature)
 
-
-def main():
-    # Create the argument parser
-    parser = argparse.ArgumentParser(description="Watch a directory for new file additions.")
-    parser.add_argument("directory", help="The directory to watch for new files.")
-
-    # Parse the command line arguments
-    args = parser.parse_args()
-
+def run_the_loop(input_dir):
     # Create an observer and attach the event handler
     observer = Observer()
-    observer.schedule(MyHandler(), path=args.directory, recursive=False)
+    observer.schedule(MyHandler(), path=input_dir, recursive=False)
 
     # Start the observer
     observer.start()
 
     try:
-        stop_file = os.path.join(args.directory, STOP_FILE_NAME)
+        stop_file = os.path.join(input_dir, STOP_FILE_NAME)
         while (not os.path.exists(stop_file)):
             time.sleep(1)  # Sleep to keep the script running
     except KeyboardInterrupt:
@@ -185,6 +177,17 @@ def main():
 
     # Wait for the observer to complete
     observer.join()
+
+def main():
+    # Create the argument parser
+    parser = argparse.ArgumentParser(description="Watch a directory for new file additions.")
+    parser.add_argument("directory", help="The directory to watch for new files.")
+
+    # Parse the command line arguments
+    args = parser.parse_args()
+    run_the_loop(args.directory)
+
+
 
 
 if __name__ == "__main__":
