@@ -14,8 +14,14 @@ import re
 import numpy
 from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
+import threading
 
 active_stacks = {}
+currenty_saving_stacks_locks = {}
+currenty_saving_stacks_dict_lock = threading.Lock()
+
+class NotImagePlaneFile(Exception):
+    pass
 
 class ImageFile:
     """
@@ -42,34 +48,39 @@ class ImageFile:
         name_parts = re.split(split_by, file_name)
         
         if len(name_parts) == 9:
-            for i, name_part in enumerate(name_parts):
-                
-                if i == 0:
-                    self.dataset_name = name_part.strip("-_")
-                elif i == 1:
-                    self.time_point = int(name_part.strip("-_"))
-                elif i == 2:
-                    self.specimen = int(name_part.strip("-_"))
-                elif i == 3:
-                    self.illumination = int(name_part.strip("-_"))
-                elif i == 4:
-                    self.camera = int(name_part.strip("-_"))
-                elif i == 5:
-                    self.channel = int(name_part.strip("-_"))
-                elif i == 6:
-                    self.plane = int(name_part.strip("-_"))
-                elif i == 7:
-                    name_and_info = name_part.strip("-_").split("_", 1)
-                    if len(name_and_info) == 1:
-                        self.total_num_planes = int(name_and_info[0].strip("-_"))
-                    else:
-                        num_planes, info = name_and_info
-                        self.total_num_planes = int(num_planes.strip("-_"))
-                        self.additional_info = info
-                elif i == 8:
-                    self.extension = name_part
+            try:
+                for i, name_part in enumerate(name_parts):
+                    
+                    if i == 0:
+                        self.dataset_name = name_part.strip("-_")
+                    elif i == 1:
+                        self.time_point = int(name_part.strip("-_"))
+                    elif i == 2:
+                        self.specimen = int(name_part.strip("-_"))
+                    elif i == 3:
+                        self.illumination = int(name_part.strip("-_"))
+                    elif i == 4:
+                        self.camera = int(name_part.strip("-_"))
+                    elif i == 5:
+                        self.channel = int(name_part.strip("-_"))
+                    elif i == 6:
+                        self.plane = int(name_part.strip("-_"))
+                    elif i == 7:
+                        name_and_info = name_part.strip("-_").split("_", 1)
+                        if len(name_and_info) == 1:
+                            self.total_num_planes = int(name_and_info[0].strip("-_"))
+                        else:
+                            num_planes, info = name_and_info
+                            self.total_num_planes = int(num_planes.strip("-_"))
+                            self.additional_info = info
+                    elif i == 8:
+                        self.extension = name_part
+            except ValueError:
+                raise NotImagePlaneFile(
+                    "This is not a valid filename for a single plane image file!"
+                )
         else:
-            raise Exception(
+            raise NotImagePlaneFile(
                 "Image file name is improperly formatted! Check documentation inside the script. Expected 8 parts after splitting by %s" % split_by)
 
         self.extension.lower()
@@ -88,63 +99,89 @@ class ImageFile:
                 )
 
     def get_name_without_extension(self):
+        return os.path.splitext(self.get_name())[0]
+
+    def get_stack_name(self):
         additional_info = self.additional_info
+        dataset_name = self.dataset_name
         if additional_info != "":
             additional_info = "_" + additional_info
-        return (f"{self.dataset_name}_TP-{self.time_point:04}"
+        if dataset_name != "":
+            dataset_name = dataset_name + "_"
+        return (f"{dataset_name}TP-{self.time_point:04}"
                 f"_SPC-{self.specimen:04}_ILL-{self.illumination}"
-                f"_CAM-{self.camera}_CH-{self.channel:02}_PL-{self.plane:04}-outOf-{self.total_num_planes:04}{additional_info}" 
+                f"_CAM-{self.camera}_CH-{self.channel:02}"
+                f"_PL-(ZS)-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}" 
                 )
+    def get_stack_path(self):
+        return os.path.join(self.path_to_image_dir, self.get_stack_name())
+    
     def get_file_path(self):
         return os.path.join(self.path_to_image_dir, self.get_name())
+    
     def get_stack_signature(self):
-        return (self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera)
+        return (self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera, self.channel)
 
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 
-def collect_files_to_one_stack(file_list, output_file_name):
-    sample_image = imread(file_list[0])
-    shape = (len(file_list), sample_image.shape[0], sample_image.shape[1])
+def collect_files_to_one_stack(file_obj_list, output_file_path):
+    if os.path.exists(output_file_path):
+        return
+    sample_image = imread(file_obj_list[0].get_file_path())
+    shape = (len(file_obj_list), sample_image.shape[0], sample_image.shape[1])
     dtype = sample_image.dtype
 
     # create an empty OME-TIFF file
-    imwrite(output_file_name, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
+    imwrite(output_file_path, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
 
     # memory map numpy array to data in OME-TIFF file
-    zyx_stack = memmap(output_file_name)
-    print(f"Writing stack to {output_file_name}")
+    zyx_stack = memmap(output_file_path)
+    print(f"Writing stack to {output_file_path}")
     # write data to memory-mapped array
-    with tqdm(total=len(file_list), desc="Saving plane") as pbar:
-        for t in range(shape[0]):
-            if t == 0:
-                zyx_stack[t] = sample_image
+    with tqdm(total=len(file_obj_list), desc="Saving plane") as pbar:
+        for z in range(shape[0]):
+            if z == 0:
+                zyx_stack[z] = sample_image
                 zyx_stack.flush()
                 pbar.update(1)
                 continue
-            zyx_stack[t] = imread(file_list[t])
+            zyx_stack[z] = imread(file_obj_list[z].get_file_path())
             zyx_stack.flush()
             pbar.update(1)
+    for z in range(shape[0]):
+        os.remove(file_obj_list[z].get_file_path())
+    stack_signature = file_obj_list[0].get_stack_signature()
+    del active_stacks[stack_signature]
+    del currenty_saving_stacks_locks[stack_signature]
 
 
 
-def add_file_to_active_stacks(file_path):
-    file = ImageFile(file_path)
-    stack_signature = file.get_stack_signature()
+def add_file_to_active_stacks(image_file : ImageFile):
+
+    stack_signature = image_file.get_stack_signature()
     if stack_signature not in active_stacks:
         active_stacks[stack_signature] = {}
         print(f"Adding stack {stack_signature} to active queue.")
-    if file.plane not in active_stacks[stack_signature]:
-        active_stacks[stack_signature][file.plane] = file 
+    if image_file.plane not in active_stacks[stack_signature]:
+        active_stacks[stack_signature][image_file.plane] = image_file 
     return stack_signature
 
-def check_if_a_stack_is_ready(stack_signature):
+def check_stack_and_collect_if_ready(stack_signature):
     if len(active_stacks[stack_signature]) < stack_signature[0]:
         return
-    file_list = []
+    # We have to ensure that two events firing at the same time don't start saving the same stack twice
+    with currenty_saving_stacks_dict_lock:
+        if stack_signature not in currenty_saving_stacks_locks:
+            currenty_saving_stacks_locks[stack_signature] = True
+        else:
+            return
+    file_obj_list = []
     for i, _ in enumerate(active_stacks[stack_signature]):
         # We have to access by index since we can't gurantee that files were added to dict in order of planes
-        file_list.append(active_stacks[stack_signature][i])
+        file_obj_list.append(active_stacks[stack_signature][i])
+    stack_path = file_obj_list[0].get_stack_path()
+    collect_files_to_one_stack(file_obj_list, stack_path)
     
 
 # Define the event handler class
@@ -156,8 +193,12 @@ class MyHandler(FileSystemEventHandler):
             return
         file_path =  event.src_path
         # Call the function when a new file is created
-        stack_signature = add_file_to_active_stacks(file_path)
-        check_if_a_stack_is_ready(stack_signature)
+        try:
+            file = ImageFile(file_path)
+        except NotImagePlaneFile:
+            return
+        stack_signature = add_file_to_active_stacks(file)
+        check_stack_and_collect_if_ready(stack_signature)
 
 def run_the_loop(input_dir):
     # Create an observer and attach the event handler
