@@ -1,4 +1,3 @@
-
 # start a continuous process from CLI
 # Every 100 ms check whether all planes for a full stack have been saved
 # We determine whether the stack is done, if new images with a higher timepoint/specimen index,
@@ -6,15 +5,19 @@
 # 
 
 import argparse
+from copy import deepcopy
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 import time
 import os
 import re
-import numpy
+import numpy as np
 from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
 import threading
+from PIL import Image
+
+STOP_FILE_NAME = "STOP_STACK_GATHERING"
 
 active_stacks = {}
 currenty_saving_stacks_locks = {}
@@ -26,7 +29,7 @@ class NotImagePlaneFile(Exception):
 class ImageFile:
     """
     File naming for light-sheet image files.
-    Example file name: TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150_blaBla.tif
+    Example file name: TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150_blaBla.tif or .bmp
     :param file_path: full path to image
     :type file_path: str
     """
@@ -122,13 +125,18 @@ class ImageFile:
     def get_stack_signature(self):
         return (self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera, self.channel)
 
-
-STOP_FILE_NAME = "STOP_STACK_GATHERING"
+def read_image(image_path):
+    if image_path.endswith(".tif"):
+        return imread(image_path)
+    if image_path.endswith(".bmp"):
+        image = Image.open(image_path)
+        return np.array(image)
+    return False
 
 def collect_files_to_one_stack(file_obj_list, output_file_path):
     if os.path.exists(output_file_path):
         return
-    sample_image = imread(file_obj_list[0].get_file_path())
+    sample_image = read_image(file_obj_list[0].get_file_path())
     shape = (len(file_obj_list), sample_image.shape[0], sample_image.shape[1])
     dtype = sample_image.dtype
 
@@ -146,7 +154,7 @@ def collect_files_to_one_stack(file_obj_list, output_file_path):
                 zyx_stack.flush()
                 pbar.update(1)
                 continue
-            zyx_stack[z] = imread(file_obj_list[z].get_file_path())
+            zyx_stack[z] = read_image(file_obj_list[z].get_file_path())
             zyx_stack.flush()
             pbar.update(1)
     for z in range(shape[0]):
@@ -180,7 +188,9 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir):
     for i, _ in enumerate(active_stacks[stack_signature]):
         # We have to access by index since we can't gurantee that files were added to dict in order of planes
         file_obj_list.append(active_stacks[stack_signature][i])
-    stack_path = os.path.join(output_dir, file_obj_list[0].get_stack_name())
+    sample_file_obj = deepcopy(file_obj_list[0])
+    sample_file_obj.extension = "tif"
+    stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
     collect_files_to_one_stack(file_obj_list, stack_path)
     
 
@@ -196,6 +206,8 @@ class MyHandler(FileSystemEventHandler):
         if event.is_directory:
             return
         file_path =  event.src_path
+        if not file_path.endswith((".tif", ".bmp")):
+            return
         # Call the function when a new file is created
         try:
             file = ImageFile(file_path)
@@ -211,6 +223,7 @@ def run_the_loop(input_dir, output_dir):
 
     # Start the observer
     observer.start()
+    print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
 
     try:
         stop_file = os.path.join(input_dir, STOP_FILE_NAME)
@@ -225,7 +238,7 @@ def run_the_loop(input_dir, output_dir):
 
 def main():
     # Create the argument parser
-    parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif files as stacks to output directory.")
+    parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif or .bmp files as stacks to output directory.")
     # Define the input_folder argument
     parser.add_argument('-i', '--input', required=True, help="Input folder path to watch.")
     
