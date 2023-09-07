@@ -167,7 +167,7 @@ def add_file_to_active_stacks(image_file : ImageFile):
         active_stacks[stack_signature][image_file.plane] = image_file 
     return stack_signature
 
-def check_stack_and_collect_if_ready(stack_signature):
+def check_stack_and_collect_if_ready(stack_signature, output_dir):
     if len(active_stacks[stack_signature]) < stack_signature[0]:
         return
     # We have to ensure that two events firing at the same time don't start saving the same stack twice
@@ -180,7 +180,7 @@ def check_stack_and_collect_if_ready(stack_signature):
     for i, _ in enumerate(active_stacks[stack_signature]):
         # We have to access by index since we can't gurantee that files were added to dict in order of planes
         file_obj_list.append(active_stacks[stack_signature][i])
-    stack_path = file_obj_list[0].get_stack_path()
+    stack_path = os.path.join(output_dir, file_obj_list[0].get_stack_name())
     collect_files_to_one_stack(file_obj_list, stack_path)
     
 
@@ -188,6 +188,10 @@ def check_stack_and_collect_if_ready(stack_signature):
 
 
 class MyHandler(FileSystemEventHandler):
+    output_dir = ""
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
     def on_created(self, event):
         if event.is_directory:
             return
@@ -198,12 +202,12 @@ class MyHandler(FileSystemEventHandler):
         except NotImagePlaneFile:
             return
         stack_signature = add_file_to_active_stacks(file)
-        check_stack_and_collect_if_ready(stack_signature)
+        check_stack_and_collect_if_ready(stack_signature, self.output_dir)
 
-def run_the_loop(input_dir):
+def run_the_loop(input_dir, output_dir):
     # Create an observer and attach the event handler
     observer = Observer()
-    observer.schedule(MyHandler(), path=input_dir, recursive=False)
+    observer.schedule(MyHandler(output_dir=output_dir), path=input_dir, recursive=False)
 
     # Start the observer
     observer.start()
@@ -221,12 +225,17 @@ def run_the_loop(input_dir):
 
 def main():
     # Create the argument parser
-    parser = argparse.ArgumentParser(description="Watch a directory for new file additions.")
-    parser.add_argument("directory", help="The directory to watch for new files.")
-
-    # Parse the command line arguments
+    parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif files as stacks to output directory.")
+    # Define the input_folder argument
+    parser.add_argument('-i', '--input', required=True, help="Input folder path to watch.")
+    
+    # Define the output_folder argument
+    parser.add_argument('-o', '--output', required=True, help="Output folder path to save satcks.")
+    
+    # Parse the command-line arguments
     args = parser.parse_args()
-    run_the_loop(args.directory)
+    
+    run_the_loop(args.input, args.output)
 
 
 
