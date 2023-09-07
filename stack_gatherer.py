@@ -133,11 +133,11 @@ def read_image(image_path):
         return np.array(image)
     return False
 
-def collect_files_to_one_stack(file_obj_list, output_file_path):
+def collect_files_to_one_stack(file_list, output_file_path):
     if os.path.exists(output_file_path):
         return
-    sample_image = read_image(file_obj_list[0].get_file_path())
-    shape = (len(file_obj_list), sample_image.shape[0], sample_image.shape[1])
+    sample_image = read_image(file_list[0])
+    shape = (len(file_list), sample_image.shape[0], sample_image.shape[1])
     dtype = sample_image.dtype
 
     # create an empty OME-TIFF file
@@ -147,22 +147,18 @@ def collect_files_to_one_stack(file_obj_list, output_file_path):
     zyx_stack = memmap(output_file_path)
     print(f"Writing stack to {output_file_path}")
     # write data to memory-mapped array
-    with tqdm(total=len(file_obj_list), desc="Saving plane") as pbar:
+    with tqdm(total=len(file_list), desc="Saving plane") as pbar:
         for z in range(shape[0]):
             if z == 0:
                 zyx_stack[z] = sample_image
                 zyx_stack.flush()
                 pbar.update(1)
                 continue
-            zyx_stack[z] = read_image(file_obj_list[z].get_file_path())
+            zyx_stack[z] = read_image(file_list[z])
             zyx_stack.flush()
             pbar.update(1)
     for z in range(shape[0]):
-        os.remove(file_obj_list[z].get_file_path())
-    stack_signature = file_obj_list[0].get_stack_signature()
-    del active_stacks[stack_signature]
-    del currenty_saving_stacks_locks[stack_signature]
-
+        os.remove(file_list[z])
 
 
 def add_file_to_active_stacks(image_file : ImageFile):
@@ -184,15 +180,16 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir):
             currenty_saving_stacks_locks[stack_signature] = True
         else:
             return
-    file_obj_list = []
+    file_list = []
     for i, _ in enumerate(active_stacks[stack_signature]):
         # We have to access by index since we can't gurantee that files were added to dict in order of planes
-        file_obj_list.append(active_stacks[stack_signature][i])
-    sample_file_obj = deepcopy(file_obj_list[0])
+        file_list.append(active_stacks[stack_signature][i].get_file_path())
+    sample_file_obj = ImageFile(file_list[0])
     sample_file_obj.extension = "tif"
     stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
-    collect_files_to_one_stack(file_obj_list, stack_path)
-    
+    collect_files_to_one_stack(file_list, stack_path)
+    del active_stacks[stack_signature]
+    del currenty_saving_stacks_locks[stack_signature]
 
 # Define the event handler class
 
