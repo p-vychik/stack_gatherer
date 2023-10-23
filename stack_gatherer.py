@@ -5,6 +5,7 @@
 # 
 
 import argparse
+import sys
 from copy import deepcopy
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -133,6 +134,75 @@ def read_image(image_path):
         return np.array(image)
     return False
 
+
+def save_planes_as_projections(file_list,
+                               output_dir,
+                               projection_axes=None,
+                               anisotropy_factor=1):
+    # define the dimension to collapse for appropriate projection
+    # Y projection - combining max values in the rows for each plane in the new matrix of size (number of planes X number of rows in a plane)
+    # X projection - combining max values in the columns for each plane in the new matrix of size (number of planes X number of columns in a plane)
+    # Z projection - new matrix of the same size as source, each value represents a max value among all values along the same depth axis
+    axes_codes = {"Y": 1, "X": 0, "Z": 0}
+    output_dir_path = {}
+    projections = {}
+    if ',' in projection_axes:
+        projection_axes = [axis.upper() for axis in projection_axes if axis in "zZxXyY"]
+    elif projection_axes in "zZxXyY":
+        projection_axes = tuple(projection_axes.upper().strip())
+    if projection_axes and file_list:
+        sample_image = read_image(file_list[0])
+        sample_file_obj = ImageFile(file_list[0])
+        dtype = sample_image.dtype
+        try:
+            for axis in projection_axes:
+                projection_folder_path = os.path.join(output_dir, f"{axis}_projections")
+                if not os.path.exists(projection_folder_path):
+                    os.makedirs(projection_folder_path)
+                output_dir_path[axis] = os.path.join(projection_folder_path, sample_file_obj.get_stack_name())
+        except OSError as err:
+            print(err)
+        for axis in projection_axes:
+            if axis == "X":
+                shape = (len(file_list), sample_image.shape[1])
+                projection_x = np.zeros(shape, dtype=dtype)
+                projections[axis] = projection_x
+            elif axis == "Y":
+                shape = (len(file_list), sample_image.shape[0])
+                projection_y = np.zeros(shape, dtype=dtype)
+                projections[axis] = projection_y
+            elif axis == "Z":
+                shape = (sample_image.shape[0], sample_image.shape[1])
+                projection_z = np.zeros(shape, dtype=dtype)
+                projections[axis] = projection_z
+
+        for i, file in enumerate(file_list):
+            plane = np.array(imread(file))
+            for axis in projection_axes:
+                if axis == "X":
+                    projection_x[i, ::] = plane.max(axis=axes_codes[axis])
+                elif axis == "Y":
+                    projection_y[i, ::] = plane.max(axis=axes_codes[axis])
+                elif axis == "Z":
+                    projection_z = np.stack((projection_z, plane))
+                    projection_z = projection_z.max(axis=axes_codes[axis])
+                    projections[axis] = projection_z
+        # transpose the plane and correct anisotropy for Y
+        if "Y" in projections:
+            projection_y = projections["Y"]
+            projection_y = projection_y.transpose()
+            img = Image.fromarray(projection_y)
+            projections["Y"] = np.array(img.resize(size=(projection_y.shape[0], projection_y.shape[1] * anisotropy_factor)))
+        # save to separate folders
+        for axis in projection_axes:
+            try:
+                imwrite(output_dir_path[axis], projections[axis])
+            except IOError as err:
+                print(err)
+    else:
+        return False
+
+
 def collect_files_to_one_stack(file_list, output_file_path):
     if os.path.exists(output_file_path):
         return
@@ -158,10 +228,7 @@ def collect_files_to_one_stack(file_list, output_file_path):
             zyx_stack.flush()
             pbar.update(1)
     for z in range(shape[0]):
-        try:
-            os.remove(file_list[z])
-        except PermissionError as e:
-            print(f"Error: {e}")
+        os.remove(file_list[z])
 
 
 def add_file_to_active_stacks(image_file : ImageFile):
@@ -174,7 +241,7 @@ def add_file_to_active_stacks(image_file : ImageFile):
         active_stacks[stack_signature][image_file.plane] = image_file 
     return stack_signature
 
-def check_stack_and_collect_if_ready(stack_signature, output_dir):
+def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, factor=None):
     if len(active_stacks[stack_signature]) < stack_signature[0]:
         return
     # We have to ensure that two events firing at the same time don't start saving the same stack twice
@@ -190,6 +257,10 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir):
     sample_file_obj = ImageFile(file_list[0])
     sample_file_obj.extension = "tif"
     stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
+    save_planes_as_projections(file_list=file_list,
+                               output_dir=output_dir,
+                               projection_axes=axes,
+                               anisotropy_factor=factor)
     collect_files_to_one_stack(file_list, stack_path)
     del active_stacks[stack_signature]
     del currenty_saving_stacks_locks[stack_signature]
@@ -199,8 +270,13 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir):
 
 class MyHandler(FileSystemEventHandler):
     output_dir = ""
-    def __init__(self, output_dir):
+    factor = 1
+    axes = ""
+
+    def __init__(self, output_dir, factor, axes):
         self.output_dir = output_dir
+        self.factor = int(factor)
+        self.axes = axes
 
     def on_created(self, event):
         if event.is_directory:
@@ -214,12 +290,17 @@ class MyHandler(FileSystemEventHandler):
         except NotImagePlaneFile:
             return
         stack_signature = add_file_to_active_stacks(file)
-        check_stack_and_collect_if_ready(stack_signature, self.output_dir)
+        check_stack_and_collect_if_ready(stack_signature, self.output_dir, self.axes, self.factor)
 
-def run_the_loop(input_dir, output_dir):
+def run_the_loop(**kwargs):
+    input_dir = kwargs.get("input")
+    output_dir = kwargs.get("output")
+    axes = kwargs.get("axes", None)
+    factor = kwargs.get("factor_anisotropy", None)
     # Create an observer and attach the event handler
     observer = Observer()
-    observer.schedule(MyHandler(output_dir=output_dir), path=input_dir, recursive=False)
+    if factor and axes:
+        observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
 
     # Start the observer
     observer.start()
@@ -244,11 +325,17 @@ def main():
     
     # Define the output_folder argument
     parser.add_argument('-o', '--output', required=True, help="Output folder path to save satcks.")
-    
+
+    # Define axes to make projections
+    parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project on the plane, i.e. X,Y,Z or X, or X")
+
+    # Anisotropy factor correction
+    parser.add_argument('-f', '--factor_anisotropy', required=True if '-a' in sys.argv else False,
+                        help="Value is used for correcting projection's anisotropic distortions")
     # Parse the command-line arguments
     args = parser.parse_args()
     
-    run_the_loop(args.input, args.output)
+    run_the_loop(**vars(args))
 
 
 
