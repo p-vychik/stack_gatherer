@@ -158,7 +158,10 @@ def collect_files_to_one_stack(file_list, output_file_path):
             zyx_stack.flush()
             pbar.update(1)
     for z in range(shape[0]):
-        os.remove(file_list[z])
+        try:
+            os.remove(file_list[z])
+        except PermissionError as e:
+            print(f"Error: {e}")
 
 
 def add_file_to_active_stacks(image_file : ImageFile):
