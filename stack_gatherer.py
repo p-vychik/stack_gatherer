@@ -135,87 +135,76 @@ def read_image(image_path):
     return False
 
 
-def save_planes_as_projections(file_list,
-                               output_dir,
-                               projection_axes=None,
-                               anisotropy_factor=1):
-    # define the dimension to collapse for appropriate projection
-    # Y projection - combining max values in the rows for each plane in the new matrix of size (number of planes X number of rows in a plane)
-    # X projection - combining max values in the columns for each plane in the new matrix of size (number of planes X number of columns in a plane)
-    # Z projection - new matrix of the same size as source, each value represents a max value among all values along the same depth axis
+def plane_to_projection(plane,
+                        output_dictionary):
+
+    '''
+    Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
+    As the funciton's output, a modified dictionary is returned that values are numpy arrays with transformed matrices.
+    for the projection specified by the dictionary key.
+    Final result is acquired only after all planes are processed sequentially.
+
+    Define the dimension to collapse for appropriate projection:
+    Y projection - combining max values in the rows for each plane
+        in the new matrix of size (number of planes X number of rows in a plane)
+    X projection - combining max values in the columns for each plane
+        in the new matrix of size (number of planes X number of columns in a plane)
+    Z projection - new matrix of the same size as source,
+        each value represents a max value among all values along the same depth-axis
+    '''
+
     axes_codes = {"Y": 1, "X": 0, "Z": 0}
-    output_dir_path = {}
-    projections = {}
-    if ',' in projection_axes:
-        projection_axes = [axis.upper() for axis in projection_axes if axis in "zZxXyY"]
-    elif projection_axes in "zZxXyY":
-        projection_axes = tuple(projection_axes.upper().strip())
-    if projection_axes and file_list:
-        sample_image = read_image(file_list[0])
-        sample_file_obj = ImageFile(file_list[0])
-        dtype = sample_image.dtype
-        try:
-            for axis in projection_axes:
-                projection_folder_path = os.path.join(output_dir, f"{axis}_projections")
-                if not os.path.exists(projection_folder_path):
-                    os.makedirs(projection_folder_path)
-                output_dir_path[axis] = os.path.join(projection_folder_path, sample_file_obj.get_stack_name())
-        except OSError as err:
-            print(err)
-        for axis in projection_axes:
-            if axis == "X":
-                shape = (len(file_list), sample_image.shape[1])
-                projection_x = np.zeros(shape, dtype=dtype)
-                projections[axis] = projection_x
-            elif axis == "Y":
-                shape = (len(file_list), sample_image.shape[0])
-                projection_y = np.zeros(shape, dtype=dtype)
-                projections[axis] = projection_y
-            elif axis == "Z":
-                shape = (sample_image.shape[0], sample_image.shape[1])
-                projection_z = np.zeros(shape, dtype=dtype)
-                projections[axis] = projection_z
-
-        for i, file in enumerate(file_list):
-            plane = np.array(imread(file))
-            for axis in projection_axes:
-                if axis == "X":
-                    projection_x[i, ::] = plane.max(axis=axes_codes[axis])
-                elif axis == "Y":
-                    projection_y[i, ::] = plane.max(axis=axes_codes[axis])
-                elif axis == "Z":
-                    projection_z = np.stack((projection_z, plane))
-                    projection_z = projection_z.max(axis=axes_codes[axis])
-                    projections[axis] = projection_z
-        # transpose the plane and correct anisotropy for Y
-        if "Y" in projections:
-            projection_y = projections["Y"]
-            projection_y = projection_y.transpose()
-            img = Image.fromarray(projection_y)
-            projections["Y"] = np.array(img.resize(size=(projection_y.shape[0], projection_y.shape[1] * anisotropy_factor)))
-        # save to separate folders
-        for axis in projection_axes:
-            try:
-                imwrite(output_dir_path[axis], projections[axis])
-            except IOError as err:
-                print(err)
-    else:
-        return False
+    axes = output_dictionary.keys()
+    for axis in axes:
+        array = output_dictionary[axis]
+        if axis == "Y" or axis == "X":
+            if isinstance(array, np.ndarray):
+                array = np.vstack((array, plane.max(axis=axes_codes[axis])))
+            else:
+                array = plane.max(axis=axes_codes[axis])
+        elif axis == "Z":
+            if isinstance(array, np.ndarray):
+                array = np.stack((array, plane))
+                array = array.max(axis=axes_codes[axis])
+            else:
+                array = plane
+        output_dictionary[axis] = array
+    return output_dictionary
 
 
-def collect_files_to_one_stack(file_list, output_file_path):
+def collect_files_to_one_stack_save_sep_projections(file_list, output_file_path,
+                                                    axes=None,
+                                                    anisotropy_factor=1,
+                                                    output_dir=None):
     if os.path.exists(output_file_path):
         return
     sample_image = read_image(file_list[0])
     shape = (len(file_list), sample_image.shape[0], sample_image.shape[1])
     dtype = sample_image.dtype
-
     # create an empty OME-TIFF file
     imwrite(output_file_path, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
-
     # memory map numpy array to data in OME-TIFF file
     zyx_stack = memmap(output_file_path)
     print(f"Writing stack to {output_file_path}")
+    # prepare input about required projections in the dictionary,
+    # the values of the appropriate keys would be the projection matrices
+    projections = {}
+    if axes:
+        projections_files_path = {}
+        if ',' in axes:
+            projections = {axis.upper():None for axis in set(axes) if axis in "zZxXyY"}
+        elif axes in "zZxXyY":
+            projections = {axes.upper().strip():None}
+        if projections:
+            try:
+                file_name = os.path.basename(file_list[0]).replace('.bmp', '.tif')
+                for axis in projections.keys():
+                    projection_folder_path = os.path.join(output_dir, f"{axis}_projections")
+                    if not os.path.exists(projection_folder_path):
+                        os.makedirs(projection_folder_path)
+                    projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
+            except OSError as err:
+                print(err)
     # write data to memory-mapped array
     with tqdm(total=len(file_list), desc="Saving plane") as pbar:
         for z in range(shape[0]):
@@ -225,8 +214,22 @@ def collect_files_to_one_stack(file_list, output_file_path):
                 pbar.update(1)
                 continue
             zyx_stack[z] = read_image(file_list[z])
+            projections = plane_to_projection(zyx_stack[z], projections)
             zyx_stack.flush()
             pbar.update(1)
+    if projections:
+        # transpose the Y projection and correct anisotropy by resizing the array with user specified factor
+        if "Y" in projections:
+            projection_y = projections["Y"]
+            projection_y = projection_y.transpose()
+            img = Image.fromarray(projection_y)
+            projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[1],
+                                                         projections["Y"].shape[0] * anisotropy_factor)))
+        for axis in projections.keys():
+            try:
+                imwrite(projections_files_path[axis], projections[axis])
+            except IOError as err:
+                print(err)
     for z in range(shape[0]):
         os.remove(file_list[z])
 
@@ -252,16 +255,15 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, fac
             return
     file_list = []
     for i, _ in enumerate(active_stacks[stack_signature]):
-        # We have to access by index since we can't gurantee that files were added to dict in order of planes
+        # We have to access by index since we can't guarantee that files were added to dict in order of planes
         file_list.append(active_stacks[stack_signature][i].get_file_path())
     sample_file_obj = ImageFile(file_list[0])
     sample_file_obj.extension = "tif"
     stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
-    save_planes_as_projections(file_list=file_list,
-                               output_dir=output_dir,
-                               projection_axes=axes,
-                               anisotropy_factor=factor)
-    collect_files_to_one_stack(file_list, stack_path)
+    collect_files_to_one_stack_save_sep_projections(file_list, stack_path,
+                                                    axes=axes,
+                                                    anisotropy_factor=factor,
+                                                    output_dir=output_dir)
     del active_stacks[stack_signature]
     del currenty_saving_stacks_locks[stack_signature]
 
@@ -299,8 +301,7 @@ def run_the_loop(**kwargs):
     factor = kwargs.get("factor_anisotropy", None)
     # Create an observer and attach the event handler
     observer = Observer()
-    if factor and axes:
-        observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
+    observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
 
     # Start the observer
     observer.start()
@@ -319,15 +320,17 @@ def run_the_loop(**kwargs):
 
 def main():
     # Create the argument parser
-    parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif or .bmp files as stacks to output directory.")
+    parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif or .bmp "
+                                                 "files as stacks to output directory.")
     # Define the input_folder argument
     parser.add_argument('-i', '--input', required=True, help="Input folder path to watch.")
     
     # Define the output_folder argument
-    parser.add_argument('-o', '--output', required=True, help="Output folder path to save satcks.")
+    parser.add_argument('-o', '--output', required=True, help="Output folder path to save stacks.")
 
     # Define axes to make projections
-    parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project on the plane, i.e. X,Y,Z or X, or X")
+    parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project "
+                                                             "on the plane, i.e. X,Y,Z or X, or X")
 
     # Anisotropy factor correction
     parser.add_argument('-f', '--factor_anisotropy', required=True if '-a' in sys.argv else False,
@@ -336,8 +339,6 @@ def main():
     args = parser.parse_args()
     
     run_the_loop(**vars(args))
-
-
 
 
 if __name__ == "__main__":
