@@ -218,13 +218,21 @@ def collect_files_to_one_stack_save_sep_projections(file_list, output_file_path,
             zyx_stack.flush()
             pbar.update(1)
     if projections:
-        # transpose the Y projection and correct anisotropy by resizing the array with user specified factor
+        # correct anisotropy for X and Y projections by resizing the array with user specified factor
         if "Y" in projections:
             projection_y = projections["Y"]
             projection_y = projection_y.transpose()
             img = Image.fromarray(projection_y)
-            projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[1],
-                                                         projections["Y"].shape[0] * anisotropy_factor)))
+            #initial
+            # projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[1], projections["Y"].shape[0] * anisotropy_factor)))
+            projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[0] * anisotropy_factor,
+                                                         projections["Y"].shape[1])))
+        if "X" in projections:
+            projection_x = projections["X"]
+            img = Image.fromarray(projection_x)
+            # img.resize(size=(width(number of matrix columns), height(number of matrix rows))
+            projections["X"] = np.array(img.resize(size=(projections["X"].shape[1],
+                                                         projections["X"].shape[0] * anisotropy_factor)))
         for axis in projections.keys():
             try:
                 imwrite(projections_files_path[axis], projections[axis])
