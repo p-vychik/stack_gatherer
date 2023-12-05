@@ -17,15 +17,27 @@ from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
 import threading
 from PIL import Image
+import napari
+from napari.qt.threading import thread_worker
+from threading import Thread
+from queue import Queue
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
+# BORDER_WIDTH defines the size of the border in pixels between
+# projections merged in one image for napari visualization
+BORDER_WIDTH = 20
+# queue for storing dictionaries with projections generated in collect_files_to_one_stack_save_sep_projections()
+PROJECTIONS_QUEUE = Queue()
+
 
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
 
+
 class NotImagePlaneFile(Exception):
     pass
+
 
 class ImageFile:
     """
@@ -85,7 +97,8 @@ class ImageFile:
                 )
         else:
             raise NotImagePlaneFile(
-                "Image file name is improperly formatted! Check documentation inside the script. Expected 8 parts after splitting by %s" % split_by)
+                "Image file name is improperly formatted! Check documentation inside the script. "
+                "Expected 8 parts after splitting by %s" % split_by)
 
         self.extension.lower()
 
@@ -117,6 +130,7 @@ class ImageFile:
                 f"_CAM-{self.camera}_CH-{self.channel:02}"
                 f"_PL-(ZS)-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}" 
                 )
+
     def get_stack_path(self):
         return os.path.join(self.path_to_image_dir, self.get_stack_name())
     
@@ -126,8 +140,9 @@ class ImageFile:
     def get_stack_signature(self):
         return (self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera, self.channel)
 
+
 def read_image(image_path):
-    if image_path.endswith(".tif"):
+    if image_path.endswith((".tif", ".tiff")):
         return imread(image_path)
     if image_path.endswith(".bmp"):
         image = Image.open(image_path)
@@ -140,14 +155,14 @@ def plane_to_projection(plane,
 
     '''
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
-    As the funciton's output, a modified dictionary is returned that values are numpy arrays with transformed matrices.
+    As the function output, a modified dictionary is returned that values are numpy arrays with transformed matrices.
     for the projection specified by the dictionary key.
     Final result is acquired only after all planes are processed sequentially.
 
     Define the dimension to collapse for appropriate projection:
     Y projection - combining max values in the rows for each plane
         in the new matrix of size (number of planes X number of rows in a plane)
-    X projection - combining max values in the columns for each plane
+    X projection - combining max values in the columns (gravity axis) for each plane
         in the new matrix of size (number of planes X number of columns in a plane)
     Z projection - new matrix of the same size as source,
         each value represents a max value among all values along the same depth-axis
@@ -189,12 +204,12 @@ def collect_files_to_one_stack_save_sep_projections(file_list, output_file_path,
     # prepare input about required projections in the dictionary,
     # the values of the appropriate keys would be the projection matrices
     projections = {}
+    projections_files_path = {}
     if axes:
-        projections_files_path = {}
         if ',' in axes:
-            projections = {axis.upper():None for axis in set(axes) if axis in "zZxXyY"}
+            projections = {axis.upper(): None for axis in set(axes) if axis in "zZxXyY"}
         elif axes in "zZxXyY":
-            projections = {axes.upper().strip():None}
+            projections = {axes.upper().strip(): None}
         if projections:
             try:
                 file_name = os.path.basename(file_list[0]).replace('.bmp', '.tif')
@@ -223,14 +238,11 @@ def collect_files_to_one_stack_save_sep_projections(file_list, output_file_path,
             projection_y = projections["Y"]
             projection_y = projection_y.transpose()
             img = Image.fromarray(projection_y)
-            #initial
-            # projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[1], projections["Y"].shape[0] * anisotropy_factor)))
             projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[0] * anisotropy_factor,
                                                          projections["Y"].shape[1])))
         if "X" in projections:
             projection_x = projections["X"]
             img = Image.fromarray(projection_x)
-            # img.resize(size=(width(number of matrix columns), height(number of matrix rows))
             projections["X"] = np.array(img.resize(size=(projections["X"].shape[1],
                                                          projections["X"].shape[0] * anisotropy_factor)))
         for axis in projections.keys():
@@ -238,11 +250,14 @@ def collect_files_to_one_stack_save_sep_projections(file_list, output_file_path,
                 imwrite(projections_files_path[axis], projections[axis])
             except IOError as err:
                 print(err)
+        # add to the globally defined queue for further visualisation in napari
+        PROJECTIONS_QUEUE.put(projections)
+
     for z in range(shape[0]):
         os.remove(file_list[z])
 
 
-def add_file_to_active_stacks(image_file : ImageFile):
+def add_file_to_active_stacks(image_file: ImageFile):
 
     stack_signature = image_file.get_stack_signature()
     if stack_signature not in active_stacks:
@@ -251,6 +266,7 @@ def add_file_to_active_stacks(image_file : ImageFile):
     if image_file.plane not in active_stacks[stack_signature]:
         active_stacks[stack_signature][image_file.plane] = image_file 
     return stack_signature
+
 
 def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, factor=None):
     if len(active_stacks[stack_signature]) < stack_signature[0]:
@@ -275,9 +291,8 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, fac
     del active_stacks[stack_signature]
     del currenty_saving_stacks_locks[stack_signature]
 
+
 # Define the event handler class
-
-
 class MyHandler(FileSystemEventHandler):
     output_dir = ""
     factor = 1
@@ -291,8 +306,8 @@ class MyHandler(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory:
             return
-        file_path =  event.src_path
-        if not file_path.endswith((".tif", ".bmp")):
+        file_path = event.src_path
+        if not file_path.endswith((".tif", ".bmp", ".tiff")):
             return
         # Call the function when a new file is created
         try:
@@ -302,7 +317,8 @@ class MyHandler(FileSystemEventHandler):
         stack_signature = add_file_to_active_stacks(file)
         check_stack_and_collect_if_ready(stack_signature, self.output_dir, self.axes, self.factor)
 
-def run_the_loop(**kwargs):
+
+def run_the_loop(kwargs):
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
     axes = kwargs.get("axes", None)
@@ -310,7 +326,6 @@ def run_the_loop(**kwargs):
     # Create an observer and attach the event handler
     observer = Observer()
     observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
-
     # Start the observer
     observer.start()
     print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
@@ -325,6 +340,7 @@ def run_the_loop(**kwargs):
 
     # Wait for the observer to complete
     observer.join()
+
 
 def main():
     # Create the argument parser
@@ -345,8 +361,65 @@ def main():
                         help="Value is used for correcting projection's anisotropic distortions")
     # Parse the command-line arguments
     args = parser.parse_args()
-    
-    run_the_loop(**vars(args))
+    viewer = napari.Viewer()
+
+    def update_layer(projections_dict):
+        # define the padding between pictures
+        # zero arrays as vertical and horizontal borders
+        image = None
+        axes_names = ''.join([axis_key for axis_key, _ in projections_dict.items()])
+        if len(projections_dict) == 3:
+            v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
+            # zero array for horizontal border
+            # rows number equals to the BORDER_WIDTH value, columns to width of concatenation of Z, Y and border array)
+            h_border_array = np.zeros((BORDER_WIDTH,
+                                       projections_dict["Z"].shape[1] + BORDER_WIDTH + projections_dict["Y"].shape[1]))
+            # extend Z projection with border and Y projection arrays
+            z_y = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
+            # merge Z_Y with horizontal border array
+            z_y = np.vstack((z_y, h_border_array))
+            x = np.hstack((projections_dict["X"],
+                           np.zeros((projections_dict["X"].shape[0], projections_dict["Y"].shape[1] + BORDER_WIDTH))))
+            image = np.vstack((z_y, x))
+        elif len(projections_dict) == 2:
+            # place largest projection in center and arrange the second at the appropriate side
+            # if only X and Y - then arrange them in a perpendicular way
+            if "Z" in new_image and "X" in new_image:
+                h_border_array = np.zeros((BORDER_WIDTH, projections_dict["Z"].shape[1]))
+                image = np.vstack((projections_dict["Z"], h_border_array, projections_dict["X"]))
+            elif "Z" in projections_dict and "Y" in projections_dict:
+                v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
+                image = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
+            else:
+                # only X and Y projections, arrange them perpendicular
+                dummy_array = np.zeros((projections_dict["Y"].shape[0], projections_dict["X"].shape[1]))
+                dummy_y = np.hstack((dummy_array, projections_dict["Y"]))
+                x_extended = np.hstack((projections_dict["X"],
+                                        np.zeros((projections_dict["X"].shape[0],
+                                                  dummy_y.shape[1] - projections_dict["X"].shape[1]))))
+                image = np.vstack((dummy_y, x_extended))
+        elif len(projections_dict) == 1:
+            image = projections_dict[axes_names]
+        if isinstance(image, np.ndarray):
+            try:
+                viewer.layers[axes_names].data = image
+            except KeyError:
+                viewer.add_image(image, name=axes_names)
+        else:
+            print("Concatenating projections failed!")
+
+    @thread_worker(connect={'yielded': update_layer})
+    def get_projections_dict_from_queue():
+        while True:
+            time.sleep(1)
+            if not PROJECTIONS_QUEUE.empty():
+                yield PROJECTIONS_QUEUE.get()
+
+    get_projections_dict_from_queue()
+    thread = Thread(target=run_the_loop, args=(vars(args), ))
+    thread.start()
+    napari.run()
+    thread.join()
 
 
 if __name__ == "__main__":
