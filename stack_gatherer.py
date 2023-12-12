@@ -20,14 +20,21 @@ from PIL import Image
 import napari
 from napari.qt.threading import thread_worker
 from threading import Thread
-from queue import Queue
+# from queue import Queue
+from collections import OrderedDict
+from qtpy.QtWidgets import QCheckBox
+import shutil
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 # BORDER_WIDTH defines the size of the border in pixels between
 # projections merged in one image for napari visualization
 BORDER_WIDTH = 20
 # queue for storing dictionaries with projections generated in collect_files_to_one_stack_save_sep_projections()
-PROJECTIONS_QUEUE = Queue()
+# PROJECTIONS_QUEUE = Queue()
+PROJECTIONS_QUEUE = OrderedDict()
+MERGE_LIGHT_MODES = False
+VIEWER = None
+TEMP_DIR = None
 
 
 active_stacks = {}
@@ -187,7 +194,9 @@ def plane_to_projection(plane,
     return output_dictionary
 
 
-def collect_files_to_one_stack_save_sep_projections(file_list, output_file_path,
+def collect_files_to_one_stack_save_sep_projections(stack_signature,
+                                                    file_list,
+                                                    output_file_path,
                                                     axes=None,
                                                     anisotropy_factor=1,
                                                     output_dir=None):
@@ -251,7 +260,15 @@ def collect_files_to_one_stack_save_sep_projections(file_list, output_file_path,
             except IOError as err:
                 print(err)
         # add to the globally defined queue for further visualisation in napari
-        PROJECTIONS_QUEUE.put(projections)
+        #PROJECTIONS_QUEUE.put(projections)
+        # we want to store projections derived from planes with different illumination modes to
+        # have an option to merge them if the user checked the QCheckBox() in napari viewer interface
+        projection_key = (stack_signature[0], stack_signature[1], stack_signature[2], stack_signature[4])
+        if projection_key not in PROJECTIONS_QUEUE:
+            PROJECTIONS_QUEUE[projection_key] = [projections]
+        else:
+            PROJECTIONS_QUEUE[projection_key].append(projections)
+
 
     for z in range(shape[0]):
         os.remove(file_list[z])
@@ -284,10 +301,13 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, fac
     sample_file_obj = ImageFile(file_list[0])
     sample_file_obj.extension = "tif"
     stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
-    collect_files_to_one_stack_save_sep_projections(file_list, stack_path,
+    collect_files_to_one_stack_save_sep_projections(stack_signature,
+                                                    file_list,
+                                                    stack_path,
                                                     axes=axes,
                                                     anisotropy_factor=factor,
-                                                    output_dir=output_dir)
+                                                    output_dir=output_dir
+                                                    )
     del active_stacks[stack_signature]
     del currenty_saving_stacks_locks[stack_signature]
 
@@ -313,6 +333,11 @@ class MyHandler(FileSystemEventHandler):
         try:
             file = ImageFile(file_path)
         except NotImagePlaneFile:
+            # image file is incorrect, move it to the temp_dir
+            try:
+                shutil.move(file_path, TEMP_DIR)
+            except OSError:
+                pass
             return
         stack_signature = add_file_to_active_stacks(file)
         check_stack_and_collect_if_ready(stack_signature, self.output_dir, self.axes, self.factor)
@@ -323,6 +348,8 @@ def run_the_loop(kwargs):
     output_dir = kwargs.get("output")
     axes = kwargs.get("axes", None)
     factor = kwargs.get("factor_anisotropy", None)
+    global TEMP_DIR
+    TEMP_DIR = kwargs.get("temp_dir", None)
     # Create an observer and attach the event handler
     observer = Observer()
     observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
@@ -341,6 +368,98 @@ def run_the_loop(kwargs):
     # Wait for the observer to complete
     observer.join()
 
+def update_layer(projections_dict):
+    # define the padding between pictures
+    # zero arrays as vertical and horizontal borders
+    image = None
+    axes_names = ''.join([axis_key for axis_key, _ in projections_dict.items()])
+    if len(projections_dict) == 3:
+        v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
+        # zero array for horizontal border
+        # rows number equals to the BORDER_WIDTH value, columns to width of concatenation of Z, Y and border array)
+        h_border_array = np.zeros((BORDER_WIDTH,
+                                   projections_dict["Z"].shape[1] + BORDER_WIDTH + projections_dict["Y"].shape[1]))
+        # extend Z projection with border and Y projection arrays
+        z_y = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
+        # merge Z_Y with horizontal border array
+        z_y = np.vstack((z_y, h_border_array))
+        x = np.hstack((projections_dict["X"],
+                       np.zeros((projections_dict["X"].shape[0], projections_dict["Y"].shape[1] + BORDER_WIDTH))))
+        image = np.vstack((z_y, x))
+    elif len(projections_dict) == 2:
+        # place largest projection in center and arrange the second at the appropriate side
+        # if only X and Y - then arrange them in a perpendicular way
+        if "Z" in new_image and "X" in new_image:
+            h_border_array = np.zeros((BORDER_WIDTH, projections_dict["Z"].shape[1]))
+            image = np.vstack((projections_dict["Z"], h_border_array, projections_dict["X"]))
+        elif "Z" in projections_dict and "Y" in projections_dict:
+            v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
+            image = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
+        else:
+            # only X and Y projections, arrange them perpendicular
+            dummy_array = np.zeros((projections_dict["Y"].shape[0], projections_dict["X"].shape[1]))
+            dummy_y = np.hstack((dummy_array, projections_dict["Y"]))
+            x_extended = np.hstack((projections_dict["X"],
+                                    np.zeros((projections_dict["X"].shape[0],
+                                              dummy_y.shape[1] - projections_dict["X"].shape[1]))))
+            image = np.vstack((dummy_y, x_extended))
+    elif len(projections_dict) == 1:
+        image = projections_dict[axes_names]
+    if isinstance(image, np.ndarray):
+        try:
+            VIEWER.layers[axes_names].data = image
+        except KeyError:
+            VIEWER.add_image(image, name=axes_names)
+    else:
+        print("Concatenating projections failed!")
+
+def merge_multiple_projections(dictionaries_list):
+    # as an input a list of dictionaries is provided
+    # [{"X": np_array, "Y":np_array, "Z": np_array}, {"X": np_array, "Y":np_array, "Z": np_array}]
+    # we have to merge appropriate projections according to the maximum intensity
+    merged_projections = {}
+    for dict in dictionaries_list[-1]:
+        for axis, plane in dict.items():
+            if axis not in merged_projections:
+                merged_projections[axis] = plane
+            else:
+                array = np.stack((merged_projections[axis], plane))
+                merged_projections[axis] = array.max(axis=0)
+    return merged_projections
+
+@thread_worker(connect={'yielded': update_layer})
+def get_projections_dict_from_queue():
+    while True:
+        time.sleep(0.5)
+        #if not PROJECTIONS_QUEUE.empty():
+        #    yield PROJECTIONS_QUEUE.get()
+        if len(PROJECTIONS_QUEUE):
+            if MERGE_LIGHT_MODES:
+                _, first_entry = next(iter(PROJECTIONS_QUEUE.items()))
+                # should check the number of light channels
+                if len(first_entry) == 2:
+                    projections_dict = merge_multiple_projections(PROJECTIONS_QUEUE.popitem(last=False))
+                    yield projections_dict
+            else:
+                _, projections_list = PROJECTIONS_QUEUE.popitem(last=False)
+                if len(projections_list) > 1:
+                    # user switched visualization mode too quick, data remain unmerged - apply merge and push to napari
+                    projections_dict = merge_multiple_projections(projections_list)
+                    yield projections_dict
+                else:
+                    yield projections_list[0]
+
+def bx_trigger():
+    global MERGE_LIGHT_MODES
+    MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
+
+def make_napari_viewer():
+    global VIEWER
+    VIEWER = napari.Viewer()
+    bx = QCheckBox('Merge illumination')
+    bx.setChecked(MERGE_LIGHT_MODES)
+    bx.stateChanged.connect(bx_trigger)
+    VIEWER.window.add_dock_widget(bx)
 
 def main():
     # Create the argument parser
@@ -359,62 +478,12 @@ def main():
     # Anisotropy factor correction
     parser.add_argument('-f', '--factor_anisotropy', required=True if '-a' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
+    # Move image files with incorrect name to the user provided directory
+    parser.add_argument('-d', '--temp_dir', required=False,
+                        help="Directory path to store input images with incorrect file name")
     # Parse the command-line arguments
     args = parser.parse_args()
-    viewer = napari.Viewer()
-
-    def update_layer(projections_dict):
-        # define the padding between pictures
-        # zero arrays as vertical and horizontal borders
-        image = None
-        axes_names = ''.join([axis_key for axis_key, _ in projections_dict.items()])
-        if len(projections_dict) == 3:
-            v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
-            # zero array for horizontal border
-            # rows number equals to the BORDER_WIDTH value, columns to width of concatenation of Z, Y and border array)
-            h_border_array = np.zeros((BORDER_WIDTH,
-                                       projections_dict["Z"].shape[1] + BORDER_WIDTH + projections_dict["Y"].shape[1]))
-            # extend Z projection with border and Y projection arrays
-            z_y = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
-            # merge Z_Y with horizontal border array
-            z_y = np.vstack((z_y, h_border_array))
-            x = np.hstack((projections_dict["X"],
-                           np.zeros((projections_dict["X"].shape[0], projections_dict["Y"].shape[1] + BORDER_WIDTH))))
-            image = np.vstack((z_y, x))
-        elif len(projections_dict) == 2:
-            # place largest projection in center and arrange the second at the appropriate side
-            # if only X and Y - then arrange them in a perpendicular way
-            if "Z" in new_image and "X" in new_image:
-                h_border_array = np.zeros((BORDER_WIDTH, projections_dict["Z"].shape[1]))
-                image = np.vstack((projections_dict["Z"], h_border_array, projections_dict["X"]))
-            elif "Z" in projections_dict and "Y" in projections_dict:
-                v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
-                image = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
-            else:
-                # only X and Y projections, arrange them perpendicular
-                dummy_array = np.zeros((projections_dict["Y"].shape[0], projections_dict["X"].shape[1]))
-                dummy_y = np.hstack((dummy_array, projections_dict["Y"]))
-                x_extended = np.hstack((projections_dict["X"],
-                                        np.zeros((projections_dict["X"].shape[0],
-                                                  dummy_y.shape[1] - projections_dict["X"].shape[1]))))
-                image = np.vstack((dummy_y, x_extended))
-        elif len(projections_dict) == 1:
-            image = projections_dict[axes_names]
-        if isinstance(image, np.ndarray):
-            try:
-                viewer.layers[axes_names].data = image
-            except KeyError:
-                viewer.add_image(image, name=axes_names)
-        else:
-            print("Concatenating projections failed!")
-
-    @thread_worker(connect={'yielded': update_layer})
-    def get_projections_dict_from_queue():
-        while True:
-            time.sleep(1)
-            if not PROJECTIONS_QUEUE.empty():
-                yield PROJECTIONS_QUEUE.get()
-
+    make_napari_viewer()
     get_projections_dict_from_queue()
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
