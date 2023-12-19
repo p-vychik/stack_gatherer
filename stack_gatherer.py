@@ -24,18 +24,32 @@ from threading import Thread
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
 import shutil
+# for PIV results visualisation with matplotlib
+from matplotlib.backends.backend_qt5agg import FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib import style
+import random
+from datetime import datetime
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 # BORDER_WIDTH defines the size of the border in pixels between
 # projections merged in one image for napari visualization
 BORDER_WIDTH = 20
-# queue for storing dictionaries with projections generated in collect_files_to_one_stack_save_sep_projections()
+# queue for storing dictionaries with projections generated in collect_files_to_one_stack_get_axial_projections()
 # PROJECTIONS_QUEUE = Queue()
 PROJECTIONS_QUEUE = OrderedDict()
 MERGE_LIGHT_MODES = False
 VIEWER = None
 TEMP_DIR = None
 
+plt.rcParams.update({'figure.autolayout': True})
+style.use('fivethirtyeight')
+FIG = plt.figure()
+DYNAMIC_CANVAS = FigureCanvas(Figure(figsize=(5, 3)))
+AX1 = DYNAMIC_CANVAS.figure.subplots()
+PIL_DATA_STORAGE = OrderedDict()
 
 active_stacks = {}
 currenty_saving_stacks_locks = {}
@@ -44,6 +58,18 @@ currenty_saving_stacks_dict_lock = threading.Lock()
 
 class NotImagePlaneFile(Exception):
     pass
+
+class ProjectionsDictWrapper:
+    projections = {}
+    signature = None
+    identifier = None
+    illumination = None
+
+    def __init__(self, dictionary, stack_signature):
+        self.projections = dictionary.copy()
+        self.signature = tuple([val for val in stack_signature])
+        self.identifier = (stack_signature[0], stack_signature[1], stack_signature[2], stack_signature[4])
+        self.illumination = stack_signature[3]
 
 
 class ImageFile:
@@ -157,8 +183,7 @@ def read_image(image_path):
     return False
 
 
-def plane_to_projection(plane,
-                        output_dictionary):
+def plane_to_projection(plane, output_dictionary):
 
     '''
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
@@ -194,7 +219,7 @@ def plane_to_projection(plane,
     return output_dictionary
 
 
-def collect_files_to_one_stack_save_sep_projections(stack_signature,
+def collect_files_to_one_stack_get_axial_projections(stack_signature,
                                                     file_list,
                                                     output_file_path,
                                                     axes=None,
@@ -243,15 +268,17 @@ def collect_files_to_one_stack_save_sep_projections(stack_signature,
             pbar.update(1)
     if projections:
         # correct anisotropy for X and Y projections by resizing the array with user specified factor
+        # .fromarray() mode parameter defines the type and depth of the pixel, here 8-bit grayscale is set with mode="L"
         if "Y" in projections:
             projection_y = projections["Y"]
             projection_y = projection_y.transpose()
-            img = Image.fromarray(projection_y)
+
+            img = Image.fromarray(projection_y, mode="L")
             projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[0] * anisotropy_factor,
                                                          projections["Y"].shape[1])))
         if "X" in projections:
             projection_x = projections["X"]
-            img = Image.fromarray(projection_x)
+            img = Image.fromarray(projection_x, mode="L")
             projections["X"] = np.array(img.resize(size=(projections["X"].shape[1],
                                                          projections["X"].shape[0] * anisotropy_factor)))
         for axis in projections.keys():
@@ -259,15 +286,15 @@ def collect_files_to_one_stack_save_sep_projections(stack_signature,
                 imwrite(projections_files_path[axis], projections[axis])
             except IOError as err:
                 print(err)
-        # add to the globally defined queue for further visualisation in napari
-        #PROJECTIONS_QUEUE.put(projections)
+
         # we want to store projections derived from planes with different illumination modes to
         # have an option to merge them if the user checked the QCheckBox() in napari viewer interface
-        projection_key = (stack_signature[0], stack_signature[1], stack_signature[2], stack_signature[4])
-        if projection_key not in PROJECTIONS_QUEUE:
-            PROJECTIONS_QUEUE[projection_key] = [projections]
+
+        wrapped_projections = ProjectionsDictWrapper(projections, stack_signature)
+        if wrapped_projections.identifier not in PROJECTIONS_QUEUE:
+            PROJECTIONS_QUEUE[wrapped_projections.identifier] = [wrapped_projections]
         else:
-            PROJECTIONS_QUEUE[projection_key].append(projections)
+            PROJECTIONS_QUEUE[wrapped_projections.identifier].append(wrapped_projections)
 
 
     for z in range(shape[0]):
@@ -301,7 +328,7 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, fac
     sample_file_obj = ImageFile(file_list[0])
     sample_file_obj.extension = "tif"
     stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
-    collect_files_to_one_stack_save_sep_projections(stack_signature,
+    collect_files_to_one_stack_get_axial_projections(stack_signature,
                                                     file_list,
                                                     stack_path,
                                                     axes=axes,
@@ -368,10 +395,13 @@ def run_the_loop(kwargs):
     # Wait for the observer to complete
     observer.join()
 
-def update_layer(projections_dict):
+
+def draw_napari_layer(projections_dict):
     # define the padding between pictures
     # zero arrays as vertical and horizontal borders
+    # projections_dict = wrapped_projections_dict.projections
     image = None
+    image_dict = {}
     axes_names = ''.join([axis_key for axis_key, _ in projections_dict.items()])
     if len(projections_dict) == 3:
         v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
@@ -405,21 +435,28 @@ def update_layer(projections_dict):
             image = np.vstack((dummy_y, x_extended))
     elif len(projections_dict) == 1:
         image = projections_dict[axes_names]
-    if isinstance(image, np.ndarray):
-        try:
-            VIEWER.layers[axes_names].data = image
-        except KeyError:
-            VIEWER.add_image(image, name=axes_names)
-    else:
-        print("Concatenating projections failed!")
+    image_dict[axes_names] = image
+    return image_dict
 
-def merge_multiple_projections(dictionaries_list):
-    # as an input a list of dictionaries is provided
-    # [{"X": np_array, "Y":np_array, "Z": np_array}, {"X": np_array, "Y":np_array, "Z": np_array}]
+
+def update_layer(layers_dict):
+    for axes_names, image in layers_dict.items():
+    #if isinstance(image, np.ndarray):
+        if axes_names not in VIEWER.layers:
+            VIEWER.add_image(image, name=axes_names)
+        else:
+            VIEWER.layers[axes_names].data = image
+
+    #else:
+        #print("Concatenating projections failed!")
+
+
+def merge_multiple_projections(wrapped_dict_list: list):
+    # as an input a list of wrapped dictionaries is provided - check class ProjectionsDictWrapper
     # we have to merge appropriate projections according to the maximum intensity
     merged_projections = {}
-    for dict in dictionaries_list[-1]:
-        for axis, plane in dict.items():
+    for wrapped_dict in wrapped_dict_list[-1]:
+        for axis, plane in wrapped_dict.projections.items():
             if axis not in merged_projections:
                 merged_projections[axis] = plane
             else:
@@ -427,9 +464,12 @@ def merge_multiple_projections(dictionaries_list):
                 merged_projections[axis] = array.max(axis=0)
     return merged_projections
 
+
 @thread_worker(connect={'yielded': update_layer})
 def get_projections_dict_from_queue():
     while True:
+        call_pill()
+        plot_pil_data()
         time.sleep(0.5)
         #if not PROJECTIONS_QUEUE.empty():
         #    yield PROJECTIONS_QUEUE.get()
@@ -439,19 +479,33 @@ def get_projections_dict_from_queue():
                 # should check the number of light channels
                 if len(first_entry) == 2:
                     projections_dict = merge_multiple_projections(PROJECTIONS_QUEUE.popitem(last=False))
-                    yield projections_dict
+                    layer_image_dict = draw_napari_layer(projections_dict)
+                    yield layer_image_dict
             else:
-                _, projections_list = PROJECTIONS_QUEUE.popitem(last=False)
-                if len(projections_list) > 1:
-                    # user switched visualization mode too quick, data remain unmerged - apply merge and push to napari
-                    projections_dict = merge_multiple_projections(projections_list)
-                    yield projections_dict
+                _, first_entry = next(iter(PROJECTIONS_QUEUE.items()))
+                if len(first_entry) > 1:
+                    # iterate through the list, assign illumination index to the axis, save all to the new ,
+                    # data remain unmerged - apply merge and push to napari
+                    _, first_entry_list = PROJECTIONS_QUEUE.popitem(last=False)
+                    image_layer_dict = {}
+                    for wrapped_dict in first_entry_list:
+                        channel_layer = draw_napari_layer(wrapped_dict.projections)
+                        for key, val in channel_layer.items():
+                            image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                    yield image_layer_dict
+                    # projections_dict = merge_multiple_projections(wrapped_dict)
+                    # yield projections_dict
                 else:
-                    yield projections_list[0]
+                    pass
+                    # layer_image_dict = draw_napari_layer(first_entry[0].projections)
+                    # yield layer_image_dict
+                    # yield projections_list[0].projections
+
 
 def bx_trigger():
     global MERGE_LIGHT_MODES
     MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
+
 
 def make_napari_viewer():
     global VIEWER
@@ -460,6 +514,29 @@ def make_napari_viewer():
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     VIEWER.window.add_dock_widget(bx)
+    AX1.plot()
+    VIEWER.window.add_dock_widget(DYNAMIC_CANVAS, area='bottom', name='PIL data')
+
+
+def plot_pil_data():
+
+    if PIL_DATA_STORAGE:
+        AX1.clear()
+        x,y = zip(*PIL_DATA_STORAGE.items())
+        AX1.plot(x, y)
+        for tick in AX1.get_xticklabels():
+            tick.set_rotation(45)
+        AX1.figure.canvas.draw()
+
+
+def call_pill():
+    global PIL_DATA_STORAGE
+    now = datetime.now()
+    current_time = now.strftime("%H:%M:%S")
+    PIL_DATA_STORAGE[current_time] = random.randint(1,20)
+    if len(PIL_DATA_STORAGE) > 40:
+        PIL_DATA_STORAGE.popitem(last=False)
+
 
 def main():
     # Create the argument parser
