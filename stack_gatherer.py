@@ -2,7 +2,8 @@
 # Every 100 ms check whether all planes for a full stack have been saved
 # We determine whether the stack is done, if new images with a higher timepoint/specimen index,
 # or if more than 30 sec has passed since last plane
-# 
+#
+import math
 
 import argparse
 import sys
@@ -20,7 +21,7 @@ from PIL import Image
 import napari
 from napari.qt.threading import thread_worker
 from threading import Thread
-# from queue import Queue
+from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
 import shutil
@@ -32,25 +33,30 @@ import matplotlib.animation as animation
 from matplotlib import style
 import random
 from datetime import datetime
+np.set_printoptions(threshold=np.inf)
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 # BORDER_WIDTH defines the size of the border in pixels between
 # projections merged in one image for napari visualization
 BORDER_WIDTH = 20
 # queue for storing dictionaries with projections generated in collect_files_to_one_stack_get_axial_projections()
+MAX_SPEED = 1
 # PROJECTIONS_QUEUE = Queue()
+PROCESSED_Z_PROJECTONS = Queue()
 PROJECTIONS_QUEUE = OrderedDict()
+DRAWN_PROJECTIONS_QUEUE = OrderedDict()
 MERGE_LIGHT_MODES = False
 VIEWER = None
 TEMP_DIR = None
-
+PIVJLPATH = ""
 plt.rcParams.update({'figure.autolayout': True})
 style.use('fivethirtyeight')
 FIG = plt.figure()
 DYNAMIC_CANVAS = FigureCanvas(Figure(figsize=(5, 3)))
+# added due to UserWarning: Tight layout not applied
+FIG.set_tight_layout(True)
 AX1 = DYNAMIC_CANVAS.figure.subplots()
 PIL_DATA_STORAGE = OrderedDict()
-
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
@@ -206,12 +212,12 @@ def plane_to_projection(plane, output_dictionary):
         array = output_dictionary[axis]
         if axis == "Y" or axis == "X":
             if isinstance(array, np.ndarray):
-                array = np.vstack((array, plane.max(axis=axes_codes[axis])))
+                array = np.vstack((array, plane.max(axis=axes_codes[axis])), dtype="uint8")
             else:
                 array = plane.max(axis=axes_codes[axis])
         elif axis == "Z":
             if isinstance(array, np.ndarray):
-                array = np.stack((array, plane))
+                array = np.stack((array, plane), dtype="uint8")
                 array = array.max(axis=axes_codes[axis])
             else:
                 array = plane
@@ -275,12 +281,17 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
 
             img = Image.fromarray(projection_y, mode="L")
             projections["Y"] = np.array(img.resize(size=(projections["Y"].shape[0] * anisotropy_factor,
-                                                         projections["Y"].shape[1])))
+                                                         projections["Y"].shape[1])), dtype='uint8')
         if "X" in projections:
             projection_x = projections["X"]
             img = Image.fromarray(projection_x, mode="L")
             projections["X"] = np.array(img.resize(size=(projections["X"].shape[1],
-                                                         projections["X"].shape[0] * anisotropy_factor)))
+                                                         projections["X"].shape[0] * anisotropy_factor)),
+                                        dtype='uint8')
+        if "Z" in projections:
+            # push it to queue for PIV calculation
+            PROCESSED_Z_PROJECTONS.put(projections["Z"])
+
         for axis in projections.keys():
             try:
                 imwrite(projections_files_path[axis], projections[axis])
@@ -295,7 +306,6 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
             PROJECTIONS_QUEUE[wrapped_projections.identifier] = [wrapped_projections]
         else:
             PROJECTIONS_QUEUE[wrapped_projections.identifier].append(wrapped_projections)
-
 
     for z in range(shape[0]):
         os.remove(file_list[z])
@@ -371,12 +381,15 @@ class MyHandler(FileSystemEventHandler):
 
 
 def run_the_loop(kwargs):
+    global TEMP_DIR
+    #global PIVJLPATH
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
-    axes = kwargs.get("axes", None)
+    axes = kwargs.get("axes", "Z")
     factor = kwargs.get("factor_anisotropy", None)
-    global TEMP_DIR
     TEMP_DIR = kwargs.get("temp_dir", None)
+    #PIVJLPATH = kwargs.get("pivjl", "")
+
     # Create an observer and attach the event handler
     observer = Observer()
     observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
@@ -404,35 +417,44 @@ def draw_napari_layer(projections_dict):
     image_dict = {}
     axes_names = ''.join([axis_key for axis_key, _ in projections_dict.items()])
     if len(projections_dict) == 3:
-        v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
+        v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH), dtype='uint8')
         # zero array for horizontal border
         # rows number equals to the BORDER_WIDTH value, columns to width of concatenation of Z, Y and border array)
         h_border_array = np.zeros((BORDER_WIDTH,
-                                   projections_dict["Z"].shape[1] + BORDER_WIDTH + projections_dict["Y"].shape[1]))
+                                   projections_dict["Z"].shape[1] + BORDER_WIDTH + projections_dict["Y"].shape[1]),
+                                  dtype='uint8')
         # extend Z projection with border and Y projection arrays
-        z_y = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
+        z_y = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]), dtype='uint8')
         # merge Z_Y with horizontal border array
-        z_y = np.vstack((z_y, h_border_array))
+        z_y = np.vstack((z_y, h_border_array), dtype='uint8')
         x = np.hstack((projections_dict["X"],
-                       np.zeros((projections_dict["X"].shape[0], projections_dict["Y"].shape[1] + BORDER_WIDTH))))
-        image = np.vstack((z_y, x))
+                       np.zeros((projections_dict["X"].shape[0], projections_dict["Y"].shape[1] + BORDER_WIDTH),
+                                dtype='uint8')),
+                      dtype='uint8')
+        image = np.vstack((z_y, x), dtype='uint8')
     elif len(projections_dict) == 2:
-        # place largest projection in center and arrange the second at the appropriate side
+        # place the largest projection in center and arrange the second at the appropriate side
         # if only X and Y - then arrange them in a perpendicular way
         if "Z" in new_image and "X" in new_image:
-            h_border_array = np.zeros((BORDER_WIDTH, projections_dict["Z"].shape[1]))
-            image = np.vstack((projections_dict["Z"], h_border_array, projections_dict["X"]))
+            h_border_array = np.zeros((BORDER_WIDTH, projections_dict["Z"].shape[1]),
+                                      dtype='uint8')
+            image = np.vstack((projections_dict["Z"], h_border_array, projections_dict["X"]),
+                              dtype='uint8')
         elif "Z" in projections_dict and "Y" in projections_dict:
-            v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH))
-            image = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]))
+            v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH),
+                                      dtype='uint8')
+            image = np.hstack((projections_dict["Z"], v_border_array, projections_dict["Y"]),
+                              dtype='uint8')
         else:
             # only X and Y projections, arrange them perpendicular
-            dummy_array = np.zeros((projections_dict["Y"].shape[0], projections_dict["X"].shape[1]))
-            dummy_y = np.hstack((dummy_array, projections_dict["Y"]))
+            dummy_array = np.zeros((projections_dict["Y"].shape[0], projections_dict["X"].shape[1]),
+                                   dtype='uint8')
+            dummy_y = np.hstack((dummy_array, projections_dict["Y"]), dtype='uint8')
             x_extended = np.hstack((projections_dict["X"],
                                     np.zeros((projections_dict["X"].shape[0],
-                                              dummy_y.shape[1] - projections_dict["X"].shape[1]))))
-            image = np.vstack((dummy_y, x_extended))
+                                              dummy_y.shape[1] - projections_dict["X"].shape[1]))),
+                                   dtype='uint8')
+            image = np.vstack((dummy_y, x_extended), dtype='uint8')
     elif len(projections_dict) == 1:
         image = projections_dict[axes_names]
     image_dict[axes_names] = image
@@ -441,14 +463,10 @@ def draw_napari_layer(projections_dict):
 
 def update_layer(layers_dict):
     for axes_names, image in layers_dict.items():
-    #if isinstance(image, np.ndarray):
         if axes_names not in VIEWER.layers:
             VIEWER.add_image(image, name=axes_names)
         else:
             VIEWER.layers[axes_names].data = image
-
-    #else:
-        #print("Concatenating projections failed!")
 
 
 def merge_multiple_projections(wrapped_dict_list: list):
@@ -460,30 +478,44 @@ def merge_multiple_projections(wrapped_dict_list: list):
             if axis not in merged_projections:
                 merged_projections[axis] = plane
             else:
-                array = np.stack((merged_projections[axis], plane))
+                array = np.stack((merged_projections[axis], plane), dtype='uint8')
                 merged_projections[axis] = array.max(axis=0)
     return merged_projections
 
 
 @thread_worker(connect={'yielded': update_layer})
 def get_projections_dict_from_queue():
+    global DRAWN_PROJECTIONS_QUEUE
     while True:
-        call_pill()
-        plot_pil_data()
-        time.sleep(0.5)
-        #if not PROJECTIONS_QUEUE.empty():
-        #    yield PROJECTIONS_QUEUE.get()
-        if len(PROJECTIONS_QUEUE):
+        time.sleep(0.2)
+        if len(PROJECTIONS_QUEUE) > 0:
             if MERGE_LIGHT_MODES:
-                _, first_entry = next(iter(PROJECTIONS_QUEUE.items()))
+                identifier, first_entry = next(iter(PROJECTIONS_QUEUE.items()))
                 # should check the number of light channels
                 if len(first_entry) == 2:
                     projections_dict = merge_multiple_projections(PROJECTIONS_QUEUE.popitem(last=False))
                     layer_image_dict = draw_napari_layer(projections_dict)
                     yield layer_image_dict
+                elif identifier in DRAWN_PROJECTIONS_QUEUE and first_entry:
+                    projections_dict = list(PROJECTIONS_QUEUE.popitem(last=False))
+                    projections_dict[-1].extend(DRAWN_PROJECTIONS_QUEUE[identifier])
+                    merged_projections_dict = merge_multiple_projections(projections_dict)
+                    layer_image_dict = draw_napari_layer(merged_projections_dict)
+                    del DRAWN_PROJECTIONS_QUEUE[identifier]
+                    yield layer_image_dict
+                elif first_entry:
+                    _,first_entry_list = PROJECTIONS_QUEUE.popitem(last=False)
+                    image_layer_dict = {}
+                    for wrapped_dict in first_entry_list:
+                        channel_layer = draw_napari_layer(wrapped_dict.projections)
+                        for key, val in channel_layer.items():
+                            image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                    DRAWN_PROJECTIONS_QUEUE[identifier] = list(first_entry_list)
+                    yield image_layer_dict
+
             else:
-                _, first_entry = next(iter(PROJECTIONS_QUEUE.items()))
-                if len(first_entry) > 1:
+                identifier, first_entry = next(iter(PROJECTIONS_QUEUE.items()))
+                if first_entry:
                     # iterate through the list, assign illumination index to the axis, save all to the new ,
                     # data remain unmerged - apply merge and push to napari
                     _, first_entry_list = PROJECTIONS_QUEUE.popitem(last=False)
@@ -492,14 +524,10 @@ def get_projections_dict_from_queue():
                         channel_layer = draw_napari_layer(wrapped_dict.projections)
                         for key, val in channel_layer.items():
                             image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                    DRAWN_PROJECTIONS_QUEUE[identifier] = list(first_entry_list)
                     yield image_layer_dict
-                    # projections_dict = merge_multiple_projections(wrapped_dict)
-                    # yield projections_dict
                 else:
-                    pass
-                    # layer_image_dict = draw_napari_layer(first_entry[0].projections)
-                    # yield layer_image_dict
-                    # yield projections_list[0].projections
+                    print("Empty projections dictionary")
 
 
 def bx_trigger():
@@ -510,7 +538,7 @@ def bx_trigger():
 def make_napari_viewer():
     global VIEWER
     VIEWER = napari.Viewer()
-    bx = QCheckBox('Merge illumination')
+    bx = QCheckBox('Merge illumination channels')
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     VIEWER.window.add_dock_widget(bx)
@@ -519,9 +547,11 @@ def make_napari_viewer():
 
 
 def plot_pil_data():
-
     if PIL_DATA_STORAGE:
+        if MAX_SPEED:
+            y_range = math.ceil(MAX_SPEED)
         AX1.clear()
+        AX1.set_ylim([0, y_range])
         x,y = zip(*PIL_DATA_STORAGE.items())
         AX1.plot(x, y)
         for tick in AX1.get_xticklabels():
@@ -530,12 +560,31 @@ def plot_pil_data():
 
 
 def call_pill():
-    global PIL_DATA_STORAGE
-    now = datetime.now()
-    current_time = now.strftime("%H:%M:%S")
-    PIL_DATA_STORAGE[current_time] = random.randint(1,20)
-    if len(PIL_DATA_STORAGE) > 40:
-        PIL_DATA_STORAGE.popitem(last=False)
+    if PIVJLPATH:
+        from juliacall import Main as jl
+        jl.include(PIVJLPATH)
+        global PIL_DATA_STORAGE
+        global MAX_SPEED
+        while True:
+            time.sleep(0.1)
+            plot_pil_data()
+            if PROCESSED_Z_PROJECTONS.qsize() >= 2:
+                m_1 = PROCESSED_Z_PROJECTONS.get()
+                # to calculate avg speed in consecutive way we store the last projection from every pairwise comparison
+                m_2 = PROCESSED_Z_PROJECTONS.queue[0]
+                if m_1.shape == m_2.shape:
+                    avg_speed = jl.fn(m_1, m_2)[-1]
+                    now = datetime.now()
+                    current_time = now.strftime("%H:%M:%S")
+                    if avg_speed:
+                        MAX_SPEED = max(avg_speed, MAX_SPEED)
+                    # dummy output for tests - PIL_DATA_STORAGE[current_time] = random.randint(1,20)
+                    PIL_DATA_STORAGE[current_time] = avg_speed
+                    plot_pil_data()
+                    if len(PIL_DATA_STORAGE) > 10:
+                        PIL_DATA_STORAGE.popitem(last=False)
+                else:
+                    print("Projections shape should be the same for QuickPIV input")
 
 
 def main():
@@ -558,9 +607,17 @@ def main():
     # Move image files with incorrect name to the user provided directory
     parser.add_argument('-d', '--temp_dir', required=False,
                         help="Directory path to store input images with incorrect file name")
+    parser.add_argument('-pivjl', '--pivjl', required=False,
+                        help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
+    global PIVJLPATH
     # Parse the command-line arguments
     args = parser.parse_args()
+    if "-pivjl" in sys.argv:
+        if os.path.isfile(args.pivjl):
+            PIVJLPATH = args.pivjl
     make_napari_viewer()
+    thread2 = Thread(target=call_pill)
+    thread2.start()
     get_projections_dict_from_queue()
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
@@ -568,5 +625,7 @@ def main():
     thread.join()
 
 
+
 if __name__ == "__main__":
     main()
+
