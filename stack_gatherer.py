@@ -40,7 +40,6 @@ STOP_FILE_NAME = "STOP_STACK_GATHERING"
 BORDER_WIDTH = 20
 # queue for storing dictionaries with projections generated in collect_files_to_one_stack_get_axial_projections()
 MAX_SPEED = 1
-# PROJECTIONS_QUEUE = Queue()
 PROCESSED_Z_PROJECTIONS = Queue()
 PROJECTIONS_QUEUE = OrderedDict()
 DRAWN_PROJECTIONS_QUEUE = OrderedDict()
@@ -63,6 +62,7 @@ currenty_saving_stacks_dict_lock = threading.Lock()
 
 class NotImagePlaneFile(Exception):
     pass
+
 
 class ProjectionsDictWrapper:
     projections = {}
@@ -190,7 +190,7 @@ def read_image(image_path):
 
 def plane_to_projection(plane, output_dictionary):
 
-    '''
+    """
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
     As the function output, a modified dictionary is returned that values are numpy arrays with transformed matrices.
     for the projection specified by the dictionary key.
@@ -203,7 +203,7 @@ def plane_to_projection(plane, output_dictionary):
         in the new matrix of size (number of planes X number of columns in a plane)
     Z projection - new matrix of the same size as source,
         each value represents a max value among all values along the same depth-axis
-    '''
+    """
 
     axes_codes = {"Y": 1, "X": 0, "Z": 0}
     axes = output_dictionary.keys()
@@ -419,7 +419,7 @@ def draw_napari_layer(projections_dict):
     if len(projections_dict) == 3:
         v_border_array = np.zeros((projections_dict["Z"].shape[0], BORDER_WIDTH), dtype=dtype_def)
         # zero array for horizontal border
-        # rows number equals to the BORDER_WIDTH value, columns to width of concatenation of Z, Y and border array)
+        # rows number equals to the BORDER_WIDTH value, columns to width of concatenation of Z, Y and border array
         h_border_array = np.zeros((BORDER_WIDTH,
                                    projections_dict["Z"].shape[1] + BORDER_WIDTH + projections_dict["Y"].shape[1]),
                                   dtype=dtype_def
@@ -608,26 +608,27 @@ def main():
     # Move image files with incorrect name to the user provided directory
     parser.add_argument('-d', '--temp_dir', required=False,
                         help="Directory path to store input images with incorrect file name")
-    parser.add_argument('-pivjl', '--pivjl', required=False,
+    parser.add_argument('--pivjl', required=False, default=False,
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
+    parser.add_argument('-debug_run', required=False, default=False, action='store_true',
+                        help="All content of --output specified folder will be DELETED!")
     global PIVJLPATH
     # Parse the command-line arguments
     args = parser.parse_args()
-    if "-pivjl" in sys.argv:
+    if args.pivjl:
         if os.path.isfile(args.pivjl):
             PIVJLPATH = args.pivjl
-
-    ### for testing purposes only - empty the output folder before loading files
-    for filename in os.listdir(args.output):
-        file_path = os.path.join(args.output, filename)
-        try:
-            if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.unlink(file_path)
-            elif os.path.isdir(file_path):
-                shutil.rmtree(file_path)
-        except Exception as e:
-            print(e)
-    ####
+    if args.debug_run:
+        # for testing purposes only - empty the output folder before loading files
+        for filename in os.listdir(args.output):
+            file_path = os.path.join(args.output, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(e)
 
     make_napari_viewer()
     thread2 = Thread(target=call_pill)
@@ -637,7 +638,6 @@ def main():
     thread.start()
     napari.run()
     thread.join()
-
 
 
 if __name__ == "__main__":
