@@ -25,6 +25,7 @@ from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
 import shutil
+import json
 # for PIV results visualisation with matplotlib
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from matplotlib.figure import Figure
@@ -43,6 +44,7 @@ MAX_SPEED = 1
 PROCESSED_Z_PROJECTIONS = Queue()
 PROJECTIONS_QUEUE = OrderedDict()
 DRAWN_PROJECTIONS_QUEUE = OrderedDict()
+JSON_CONFIGS = {}
 MERGE_LIGHT_MODES = False
 VIEWER = None
 TEMP_DIR = None
@@ -225,11 +227,11 @@ def plane_to_projection(plane, output_dictionary):
 
 
 def collect_files_to_one_stack_get_axial_projections(stack_signature,
-                                                    file_list,
-                                                    output_file_path,
-                                                    axes=None,
-                                                    anisotropy_factor=1,
-                                                    output_dir=None):
+                                                     file_list,
+                                                     output_file_path,
+                                                     axes=None,
+                                                     anisotropy_factor=1,
+                                                     output_dir=None):
     if os.path.exists(output_file_path):
         return
     sample_image = read_image(file_list[0])
@@ -273,7 +275,6 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
             pbar.update(1)
     if projections:
         # correct anisotropy for X and Y projections by resizing the array with user specified factor
-        # .fromarray() mode parameter defines the type and depth of the pixel, here 8-bit grayscale is set with mode="L"
         if "Y" in projections:
             projection_y = projections["Y"]
             projection_y = projection_y.transpose()
@@ -288,8 +289,10 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
                                                          projections["X"].shape[0] * anisotropy_factor))
                                         )
         if "Z" in projections:
-            # push it to queue for PIV calculation
-            PROCESSED_Z_PROJECTIONS.put(projections["Z"])
+            # push to the queue for PIV calculations
+            wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
+            PROCESSED_Z_PROJECTIONS.put(wrapped_z_projection)
+            # PROCESSED_Z_PROJECTIONS.put(projections["Z"])
 
         for axis in projections.keys():
             try:
@@ -338,12 +341,11 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, fac
     sample_file_obj.extension = "tif"
     stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
     collect_files_to_one_stack_get_axial_projections(stack_signature,
-                                                    file_list,
-                                                    stack_path,
-                                                    axes=axes,
-                                                    anisotropy_factor=factor,
-                                                    output_dir=output_dir
-                                                    )
+                                                     file_list,
+                                                     stack_path,
+                                                     axes=axes,
+                                                     anisotropy_factor=factor,
+                                                     output_dir=output_dir)
     del active_stacks[stack_signature]
     del currenty_saving_stacks_locks[stack_signature]
 
@@ -363,20 +365,48 @@ class MyHandler(FileSystemEventHandler):
         if event.is_directory:
             return
         file_path = event.src_path
-        if not file_path.endswith((".tif", ".bmp", ".tiff")):
-            return
-        # Call the function when a new file is created
-        try:
-            file = ImageFile(file_path)
-        except NotImagePlaneFile:
-            # image file is incorrect, move it to the temp_dir
+        # load json parameters
+        if file_path.endswith(".json"):
+            with open(file_path) as j_file:
+                lapse_parameters = json.load(j_file)
+                setup_signature = []
+                for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
+                    timepoint = lapse_parameters["timelapse"]["timepoints"]
+                    total_num_planes = spec_entry["number_of_planes"]
+                    for channel_num, channel in enumerate(spec_entry["channels"]):
+                        for camera_num, enabled in enumerate(channel["camerasEnabled"]):
+                            if enabled:
+                                setup_signature.append((total_num_planes,
+                                                        timepoint,
+                                                        specimen_number,
+                                                        channel["illuminationLine"],
+                                                        camera_num,
+                                                        channel_num))
+                JSON_CONFIGS.update(dict.fromkeys(setup_signature, lapse_parameters))
             try:
                 shutil.move(file_path, TEMP_DIR)
-            except OSError:
-                pass
-            return
-        stack_signature = add_file_to_active_stacks(file)
-        check_stack_and_collect_if_ready(stack_signature, self.output_dir, self.axes, self.factor)
+            except Exception as error:
+                print(error)
+        else:
+            if not file_path.endswith((".tif", ".bmp", ".tiff")):
+                return
+            # Call the function when a new file is created
+            try:
+                file = ImageFile(file_path)
+            except NotImagePlaneFile:
+                # image file is incorrect, move it to the temp_dir
+                try:
+                    shutil.move(file_path, TEMP_DIR)
+                except OSError:
+                    pass
+                return
+            # while file.get_stack_signature() not in JSON_CONFIGS:
+            #     time.sleep(0.1)
+            # if file.get_stack_signature() in JSON_CONFIGS:
+            stack_signature = add_file_to_active_stacks(file)
+            check_stack_and_collect_if_ready(stack_signature, self.output_dir, self.axes, self.factor)
+            # else:
+                #print(f"signature is not in stack {file.get_stack_signature()}")
 
 
 def run_the_loop(kwargs):
@@ -412,6 +442,7 @@ def draw_napari_layer(projections_dict):
     # projections_dict = wrapped_projections_dict.projections
     image = None
     image_dict = {}
+    dtype_def = "uint8"
     axes_names = ''.join([axis_key for axis_key, _ in projections_dict.items()])
     for _, projection in projections_dict.items():
         dtype_def = projection.dtype
@@ -495,7 +526,7 @@ def get_projections_dict_from_queue():
         time.sleep(0.2)
         if len(PROJECTIONS_QUEUE) > 0:
             image_layer_dict = {}
-            # store last 3 projections drawn in napari layer for merging channels purpose
+            # store last 4 projections drawn in napari layer for merging channels purpose
             if len(DRAWN_PROJECTIONS_QUEUE) > 4:
                 DRAWN_PROJECTIONS_QUEUE.popitem(last=False)
             identifier, projections_dict_list = PROJECTIONS_QUEUE.popitem(last=False)
@@ -569,23 +600,31 @@ def call_pill():
         while True:
             time.sleep(0.1)
             if PROCESSED_Z_PROJECTIONS.qsize() >= 2:
-                m_1 = PROCESSED_Z_PROJECTIONS.get()
+                wrapped_z_p_1 = PROCESSED_Z_PROJECTIONS.get()
                 # to calculate avg speed in consecutive way we store
                 # the last projection from every pairwise comparison
-                m_2 = PROCESSED_Z_PROJECTIONS.queue[0]
-                if m_1.shape == m_2.shape:
-                    avg_speed = jl.fn(m_1, m_2)
-                    avg_speed = avg_speed[-1]
-                    now = datetime.now()
-                    current_time = now.strftime("%H:%M:%S")
-                    if avg_speed:
-                        MAX_SPEED = max(avg_speed, MAX_SPEED)
-                    PIL_DATA_STORAGE[current_time] = avg_speed
-                    plot_pil_data()
-                    if len(PIL_DATA_STORAGE) > 10:
-                        PIL_DATA_STORAGE.popitem(last=False)
+                wrapped_z_p_2 = PROCESSED_Z_PROJECTIONS.queue[0]
+                if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
+                    merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
+                                                                     (wrapped_z_p_1, wrapped_z_p_2)))
+                    wrapped_projections = ProjectionsDictWrapper(merged_projections, wrapped_z_p_2.signature)
+                    PROCESSED_Z_PROJECTIONS.queue.insert(0, wrapped_projections)
                 else:
-                    print("Projections should have the same size for QuickPIV input")
+                    m_1 = wrapped_z_p_1.projections["Z"]
+                    m_2 = wrapped_z_p_2.projections["Z"]
+                    if m_1.shape == m_2.shape:
+                        avg_speed = jl.fn(m_1, m_2)
+                        avg_speed = avg_speed[-1]
+                        now = datetime.now()
+                        current_time = now.strftime("%H:%M:%S")
+                        if avg_speed:
+                            MAX_SPEED = max(avg_speed, MAX_SPEED)
+                        PIL_DATA_STORAGE[current_time] = avg_speed
+                        plot_pil_data()
+                        if len(PIL_DATA_STORAGE) > 10:
+                            PIL_DATA_STORAGE.popitem(last=False)
+                    else:
+                        print("Projections should have the same size for QuickPIV input")
 
 
 def main():
@@ -606,7 +645,7 @@ def main():
     parser.add_argument('-f', '--factor_anisotropy', required=True if '-a' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
     # Move image files with incorrect name to the user provided directory
-    parser.add_argument('-d', '--temp_dir', required=False,
+    parser.add_argument('-d', '--temp_dir', required=True,
                         help="Directory path to store input images with incorrect file name")
     parser.add_argument('--pivjl', required=False, default=False,
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
@@ -642,4 +681,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
