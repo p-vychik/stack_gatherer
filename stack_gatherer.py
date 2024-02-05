@@ -36,6 +36,7 @@ from datetime import datetime
 np.set_printoptions(threshold=np.inf)
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
+ACQUISITION_META_FILE_PATTERN = "AcquisitionMetadata_"
 # BORDER_WIDTH defines the size of the border in pixels between
 # projections merged in one image for napari visualization
 BORDER_WIDTH = 20
@@ -366,7 +367,7 @@ class MyHandler(FileSystemEventHandler):
             return
         file_path = event.src_path
         # load json parameters
-        if file_path.endswith(".json"):
+        if file_path.startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
             with open(file_path) as j_file:
                 lapse_parameters = json.load(j_file)
                 setup_signature = []
