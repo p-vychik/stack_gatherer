@@ -56,7 +56,7 @@ FIG = plt.figure()
 DYNAMIC_CANVAS = FigureCanvas(Figure(figsize=(5, 3)))
 # added due to UserWarning: Tight layout not applied
 
-AX1 = DYNAMIC_CANVAS.figure.subplots()
+PIV_PLOT_CANVAS = DYNAMIC_CANVAS.figure.subplots()
 PIL_DATA_STORAGE = OrderedDict()
 active_stacks = {}
 currenty_saving_stacks_locks = {}
@@ -78,6 +78,7 @@ class ProjectionsDictWrapper:
         self.signature = tuple([val for val in stack_signature])
         self.identifier = (stack_signature[0], stack_signature[1], stack_signature[2], stack_signature[4])
         self.illumination = stack_signature[3]
+
 
 
 class ImageFile:
@@ -532,7 +533,7 @@ def get_projections_dict_from_queue():
                 DRAWN_PROJECTIONS_QUEUE.popitem(last=False)
             identifier, projections_dict_list = PROJECTIONS_QUEUE.popitem(last=False)
             if MERGE_LIGHT_MODES:
-                # should check the number of light channels
+                # should check the number of illuminations
                 if len(projections_dict_list) == 2:
                     merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
                     image_layer_dict = draw_napari_layer(merged_projections_dict)
@@ -574,30 +575,31 @@ def make_napari_viewer():
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     VIEWER.window.add_dock_widget(bx)
-    AX1.plot()
+    PIV_PLOT_CANVAS.plot()
     VIEWER.window.add_dock_widget(DYNAMIC_CANVAS, area='bottom', name='PIL data')
 
 
 def plot_pil_data():
     if PIL_DATA_STORAGE:
         y_range = math.ceil(MAX_SPEED * 1.5)
-        AX1.clear()
-        AX1.set_ylim([0, y_range])
+        PIV_PLOT_CANVAS.clear()
+        PIV_PLOT_CANVAS.set_ylim([0, y_range])
         x, y = zip(*PIL_DATA_STORAGE.items())
-        AX1.plot(x, y)
-        AX1.set_xticklabels(x, fontsize=10, rotation=30)
+        PIV_PLOT_CANVAS.plot(x, y)
+        PIV_PLOT_CANVAS.set_xticklabels(x, fontsize=10, rotation=30)
         # for tick in AX1.get_xticklabels():
         #     tick.set_rotation(30)
-        AX1.figure.canvas.draw()
+        PIV_PLOT_CANVAS.figure.canvas.draw()
         FIG.tight_layout()
 
 
-def call_pill():
+def PIV_worker():
     if PIVJLPATH:
         from juliacall import Main as jl
         jl.include(PIVJLPATH)
         global PIL_DATA_STORAGE
         global MAX_SPEED
+        piv_projection_queue = Queue()
         while True:
             time.sleep(0.1)
             if PROCESSED_Z_PROJECTIONS.qsize() >= 2:
@@ -605,27 +607,34 @@ def call_pill():
                 # to calculate avg speed in consecutive way we store
                 # the last projection from every pairwise comparison
                 wrapped_z_p_2 = PROCESSED_Z_PROJECTIONS.queue[0]
+                
                 if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
                     merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
                                                                      (wrapped_z_p_1, wrapped_z_p_2)))
-                    wrapped_projections = ProjectionsDictWrapper(merged_projections, wrapped_z_p_2.signature)
-                    PROCESSED_Z_PROJECTIONS.queue.insert(0, wrapped_projections)
+                    merged_wrapped_proj = ProjectionsDictWrapper(merged_projections, wrapped_z_p_2.signature)
+                    piv_projection_queue.put(merged_wrapped_proj)
+                    PROCESSED_Z_PROJECTIONS.get()
                 else:
-                    m_1 = wrapped_z_p_1.projections["Z"]
-                    m_2 = wrapped_z_p_2.projections["Z"]
-                    if m_1.shape == m_2.shape:
-                        avg_speed = jl.fn(m_1, m_2)
-                        avg_speed = avg_speed[-1]
-                        now = datetime.now()
-                        current_time = now.strftime("%H:%M:%S")
-                        if avg_speed:
-                            MAX_SPEED = max(avg_speed, MAX_SPEED)
-                        PIL_DATA_STORAGE[current_time] = avg_speed
-                        plot_pil_data()
-                        if len(PIL_DATA_STORAGE) > 10:
-                            PIL_DATA_STORAGE.popitem(last=False)
-                    else:
-                        print("Projections should have the same size for QuickPIV input")
+                    piv_projection_queue.put(wrapped_z_p_1)
+
+                if piv_projection_queue.qsize() < 2: 
+                    continue
+
+                m_1 = piv_projection_queue.get().projections["Z"]
+                m_2 = piv_projection_queue.get().projections["Z"]
+                if m_1.shape == m_2.shape:
+                    avg_speed = jl.fn(m_1, m_2)
+                    avg_speed = avg_speed[-1]
+                    now = datetime.now()
+                    current_time = now.strftime("%H:%M:%S")
+                    if avg_speed:
+                        MAX_SPEED = max(avg_speed, MAX_SPEED)
+                    PIL_DATA_STORAGE[current_time] = avg_speed
+                    plot_pil_data()
+                    if len(PIL_DATA_STORAGE) > 10:
+                        PIL_DATA_STORAGE.popitem(last=False)
+                else:
+                    print("Projections should have the same size for QuickPIV input")
 
 
 def main():
@@ -671,7 +680,7 @@ def main():
                 print(e)
 
     make_napari_viewer()
-    thread2 = Thread(target=call_pill)
+    thread2 = Thread(target=PIV_worker)
     thread2.start()
     get_projections_dict_from_queue()
     thread = Thread(target=run_the_loop, args=(vars(args), ))
