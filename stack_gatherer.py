@@ -24,6 +24,7 @@ from threading import Thread
 from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
+from dataclasses import dataclass
 import shutil
 import json
 # for PIV results visualisation with matplotlib
@@ -67,18 +68,52 @@ class NotImagePlaneFile(Exception):
     pass
 
 
+@dataclass
+class StackSignature:
+    total_num_planes: int
+    time_point: int
+    specimen: int
+    illumination: int
+    camera: int
+    channel: int
+
+    def get_attr_excluding(self, exclude_fields=None) -> tuple:
+        if isinstance(exclude_fields, tuple) or isinstance(exclude_fields, list):
+            return tuple([val for attribute, val in self.__dict__.items() if attribute not in exclude_fields])
+        if exclude_fields:
+            return tuple([val for attribute, val in self.__dict__.items() if attribute != exclude_fields])
+        return self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera, self.channel
+
+    def __hash__(self):
+        return hash(self.get_attr_excluding())
+
+    @property
+    def signature(self):
+        return self.get_attr_excluding()
+
+
+@dataclass
 class ProjectionsDictWrapper:
-    projections = {}
-    signature = None
-    identifier = None
-    illumination = None
+    """
+    identifier property defines the lapse mode parameters used except the illumination;
+    illumination property is a value that identify the light mode used for a plane;
+    signature property is a tuple with values representing parameters used for lapse and stored as object
+    of the StackSignature class
+    """
+    projections: dict
+    stack_signature_obj: StackSignature
 
-    def __init__(self, dictionary, stack_signature):
-        self.projections = dictionary.copy()
-        self.signature = tuple([val for val in stack_signature])
-        self.identifier = (stack_signature[0], stack_signature[1], stack_signature[2], stack_signature[4])
-        self.illumination = stack_signature[3]
+    @property
+    def identifier(self) -> tuple:
+        return self.stack_signature_obj.get_attr_excluding("illumination")
 
+    @property
+    def illumination(self) -> int:
+        return self.stack_signature_obj.illumination
+
+    @property
+    def signature(self) -> tuple:
+        return self.stack_signature_obj.get_attr_excluding()
 
 
 class ImageFile:
@@ -102,7 +137,7 @@ class ImageFile:
     def __init__(self, file_path):
         self.path_to_image_dir = os.path.dirname(file_path)
         file_name = os.path.basename(file_path)
-        split_by = "TP-|SPC-|ILL-|CAM-|CH-|PL-|outOf-|\."
+        split_by = r"TP-|SPC-|ILL-|CAM-|CH-|PL-|outOf-|\."
         name_parts = re.split(split_by, file_name)
         
         if len(name_parts) == 9:
@@ -180,7 +215,12 @@ class ImageFile:
         return os.path.join(self.path_to_image_dir, self.get_name())
     
     def get_stack_signature(self):
-        return (self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera, self.channel)
+        return StackSignature(self.total_num_planes,
+                              self.time_point,
+                              self.specimen,
+                              self.illumination,
+                              self.camera,
+                              self.channel)
 
 
 def read_image(image_path):
@@ -306,7 +346,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
         # have an option to merge them if the user checked the QCheckBox() in napari viewer GUI interface
 
         wrapped_projections = ProjectionsDictWrapper(projections, stack_signature)
-        if wrapped_projections.identifier not in PROJECTIONS_QUEUE:
+        if wrapped_projections.signature not in PROJECTIONS_QUEUE:
             PROJECTIONS_QUEUE[wrapped_projections.identifier] = [wrapped_projections]
         else:
             PROJECTIONS_QUEUE[wrapped_projections.identifier].append(wrapped_projections)
@@ -318,27 +358,27 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
 def add_file_to_active_stacks(image_file: ImageFile):
 
     stack_signature = image_file.get_stack_signature()
-    if stack_signature not in active_stacks:
-        active_stacks[stack_signature] = {}
-        print(f"Adding stack {stack_signature} to active queue.")
-    if image_file.plane not in active_stacks[stack_signature]:
-        active_stacks[stack_signature][image_file.plane] = image_file 
+    if stack_signature.signature not in active_stacks:
+        active_stacks[stack_signature.signature] = {}
+        print(f"Adding stack {stack_signature.signature} to active queue.")
+    if image_file.plane not in active_stacks[stack_signature.signature]:
+        active_stacks[stack_signature.signature][image_file.plane] = image_file
     return stack_signature
 
 
 def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, factor=None):
-    if len(active_stacks[stack_signature]) < stack_signature[0]:
+    if len(active_stacks[stack_signature.signature]) < stack_signature.total_num_planes:
         return
     # We have to ensure that two events firing at the same time don't start saving the same stack twice
     with currenty_saving_stacks_dict_lock:
         if stack_signature not in currenty_saving_stacks_locks:
-            currenty_saving_stacks_locks[stack_signature] = True
+            currenty_saving_stacks_locks[stack_signature.signature] = True
         else:
             return
     file_list = []
-    for i, _ in enumerate(active_stacks[stack_signature]):
+    for i, _ in enumerate(active_stacks[stack_signature.signature]):
         # We have to access by index since we can't guarantee that files were added to dict in order of planes
-        file_list.append(active_stacks[stack_signature][i].get_file_path())
+        file_list.append(active_stacks[stack_signature.signature][i].get_file_path())
     sample_file_obj = ImageFile(file_list[0])
     sample_file_obj.extension = "tif"
     stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
@@ -348,8 +388,8 @@ def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, fac
                                                      axes=axes,
                                                      anisotropy_factor=factor,
                                                      output_dir=output_dir)
-    del active_stacks[stack_signature]
-    del currenty_saving_stacks_locks[stack_signature]
+    del active_stacks[stack_signature.signature]
+    del currenty_saving_stacks_locks[stack_signature.signature]
 
 
 # Define the event handler class
@@ -368,9 +408,11 @@ class MyHandler(FileSystemEventHandler):
             return
         file_path = event.src_path
         # load json parameters
-        if file_path.startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
+        if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
+            destination_folder = os.path.join(self.output_dir, os.path.basename(file_path).strip(".json"))
             with open(file_path) as j_file:
                 lapse_parameters = json.load(j_file)
+                lapse_parameters["output_folder"] = destination_folder
                 setup_signature = []
                 for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
                     timepoint = lapse_parameters["timelapse"]["timepoints"]
@@ -385,8 +427,11 @@ class MyHandler(FileSystemEventHandler):
                                                         camera_num,
                                                         channel_num))
                 JSON_CONFIGS.update(dict.fromkeys(setup_signature, lapse_parameters))
+            time.sleep(0.1)
             try:
-                shutil.move(file_path, TEMP_DIR)
+                if not os.path.exists(destination_folder):
+                    os.mkdir(destination_folder)
+                    shutil.move(file_path, destination_folder)
             except Exception as error:
                 print(error)
         else:
@@ -404,11 +449,14 @@ class MyHandler(FileSystemEventHandler):
                 return
             # while file.get_stack_signature() not in JSON_CONFIGS:
             #     time.sleep(0.1)
-            # if file.get_stack_signature() in JSON_CONFIGS:
             stack_signature = add_file_to_active_stacks(file)
-            check_stack_and_collect_if_ready(stack_signature, self.output_dir, self.axes, self.factor)
-            # else:
-                #print(f"signature is not in stack {file.get_stack_signature()}")
+            # create separate folder for the output based on metadata filename
+            try:
+                output_dir = JSON_CONFIGS[stack_signature.signature]["output_folder"]
+                if os.path.exists(output_dir):
+                    check_stack_and_collect_if_ready(stack_signature, output_dir, self.axes, self.factor)
+            except KeyError:
+                print("key_error")
 
 
 def run_the_loop(kwargs):
