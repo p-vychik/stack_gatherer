@@ -4,10 +4,8 @@
 # or if more than 30 sec has passed since last plane
 #
 import math
-
 import argparse
 import sys
-from copy import deepcopy
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 import time
@@ -27,6 +25,7 @@ from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
 import shutil
 import json
+import csv
 # for PIV results visualisation with matplotlib
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from matplotlib.figure import Figure
@@ -410,11 +409,18 @@ class MyHandler(FileSystemEventHandler):
         # load json parameters
         if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
             destination_folder = os.path.join(self.output_dir, os.path.basename(file_path).strip(".json"))
-            with open(file_path) as j_file:
+            lapse_parameters = None
+            try:
+                j_file = open(file_path)
                 lapse_parameters = json.load(j_file)
+                j_file.close()
+            except PermissionError:
+                print(f"{file_path} permission error, check if file is already opened")
+            if lapse_parameters:
                 lapse_parameters["output_folder"] = destination_folder
                 setup_signature = []
-                for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
+                # in the filename specimen's index usually starts from 1
+                for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"], start=1):
                     timepoint = lapse_parameters["timelapse"]["timepoints"]
                     total_num_planes = spec_entry["number_of_planes"]
                     for channel_num, channel in enumerate(spec_entry["channels"]):
@@ -427,7 +433,6 @@ class MyHandler(FileSystemEventHandler):
                                                         camera_num,
                                                         channel_num))
                 JSON_CONFIGS.update(dict.fromkeys(setup_signature, lapse_parameters))
-            time.sleep(0.1)
             try:
                 if not os.path.exists(destination_folder):
                     os.mkdir(destination_folder)
@@ -456,7 +461,7 @@ class MyHandler(FileSystemEventHandler):
                 if os.path.exists(output_dir):
                     check_stack_and_collect_if_ready(stack_signature, output_dir, self.axes, self.factor)
             except KeyError:
-                print("key_error")
+                print("No lapse configuration for the plane, check if appropriate AcquisitionMeta file is loaded")
 
 
 def run_the_loop(kwargs):
@@ -481,7 +486,14 @@ def run_the_loop(kwargs):
     except KeyboardInterrupt:
         # Gracefully stop the observer if the script is interrupted
         observer.stop()
-
+    # save PIV data to csv
+    if PIL_DATA_STORAGE:
+        with open(os.path.join(output_dir, "quckPIV_data.csv"), 'w') as f_out:
+            w = csv.writer(f_out)
+            try:
+                w.writerows(PIL_DATA_STORAGE.items())
+            except IOError:
+                print(f"Attempt to save csv data to {output_dir} failed")
     # Wait for the observer to complete
     observer.join()
 
@@ -623,19 +635,20 @@ def make_napari_viewer():
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     VIEWER.window.add_dock_widget(bx)
-    PIV_PLOT_CANVAS.plot()
-    VIEWER.window.add_dock_widget(DYNAMIC_CANVAS, area='bottom', name='PIL data')
+    if PIVJLPATH:
+        PIV_PLOT_CANVAS.plot(0,0)
+        VIEWER.window.add_dock_widget(DYNAMIC_CANVAS, area='bottom', name='PIL data')
 
 
-def plot_pil_data():
-    if PIL_DATA_STORAGE:
+def plot_pil_data(piv_data):
+    if piv_data:
         y_range = math.ceil(MAX_SPEED * 1.5)
         PIV_PLOT_CANVAS.clear()
         PIV_PLOT_CANVAS.set_ylim([0, y_range])
-        x, y = zip(*PIL_DATA_STORAGE.items())
+        x, y = zip(*piv_data.items())
         PIV_PLOT_CANVAS.plot(x, y)
         PIV_PLOT_CANVAS.set_xticklabels(x, fontsize=10, rotation=30)
-        # for tick in AX1.get_xticklabels():
+        # for tick in PIV_PLOT_CANVAS.get_xticklabels():
         #     tick.set_rotation(30)
         PIV_PLOT_CANVAS.figure.canvas.draw()
         FIG.tight_layout()
@@ -672,15 +685,17 @@ def PIV_worker():
                 m_2 = piv_projection_queue.get().projections["Z"]
                 if m_1.shape == m_2.shape:
                     avg_speed = jl.fn(m_1, m_2)
-                    avg_speed = avg_speed[-1]
+                    avg_speed = round(avg_speed[-1], 3)
                     now = datetime.now()
                     current_time = now.strftime("%H:%M:%S")
                     if avg_speed:
                         MAX_SPEED = max(avg_speed, MAX_SPEED)
                     PIL_DATA_STORAGE[current_time] = avg_speed
-                    plot_pil_data()
-                    if len(PIL_DATA_STORAGE) > 10:
-                        PIL_DATA_STORAGE.popitem(last=False)
+                    if len(PIL_DATA_STORAGE) > 15:
+                        # PIL_DATA_STORAGE.popitem(last=False)
+                        plot_pil_data(PIL_DATA_STORAGE[-15::])
+                    else:
+                        plot_pil_data(PIL_DATA_STORAGE)
                 else:
                     print("Projections should have the same size for QuickPIV input")
 
@@ -728,8 +743,9 @@ def main():
                 print(e)
 
     make_napari_viewer()
-    thread2 = Thread(target=PIV_worker)
-    thread2.start()
+    if PIVJLPATH:
+        piv_worker_thread = Thread(target=PIV_worker)
+        piv_worker_thread.start()
     get_projections_dict_from_queue()
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
