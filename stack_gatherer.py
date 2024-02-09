@@ -290,7 +290,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
     if axes:
         if ',' in axes:
             projections = {axis.upper(): None for axis in set(axes) if axis in "zZxXyY"}
-        elif axes in "zZxXyY":
+        if axes in "zZxXyY":
             projections = {axes.upper().strip(): None}
         if projections:
             try:
@@ -461,7 +461,7 @@ class MyHandler(FileSystemEventHandler):
                 if os.path.exists(output_dir):
                     check_stack_and_collect_if_ready(stack_signature, output_dir, self.axes, self.factor)
             except KeyError:
-                print("No lapse configuration for the plane, check if appropriate AcquisitionMeta file is loaded")
+                print("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
 
 
 def run_the_loop(kwargs):
@@ -488,7 +488,7 @@ def run_the_loop(kwargs):
         observer.stop()
     # save PIV data to csv
     if PIL_DATA_STORAGE:
-        with open(os.path.join(output_dir, "quckPIV_data.csv"), 'w') as f_out:
+        with open(os.path.join(output_dir, "quckPIV_data.csv"), 'w', newline='') as f_out:
             w = csv.writer(f_out)
             try:
                 w.writerows(PIL_DATA_STORAGE.items())
@@ -647,9 +647,8 @@ def plot_pil_data(piv_data):
         PIV_PLOT_CANVAS.set_ylim([0, y_range])
         x, y = zip(*piv_data.items())
         PIV_PLOT_CANVAS.plot(x, y)
+        PIV_PLOT_CANVAS.xaxis.set_ticks(x)
         PIV_PLOT_CANVAS.set_xticklabels(x, fontsize=10, rotation=30)
-        # for tick in PIV_PLOT_CANVAS.get_xticklabels():
-        #     tick.set_rotation(30)
         PIV_PLOT_CANVAS.figure.canvas.draw()
         FIG.tight_layout()
 
@@ -680,9 +679,10 @@ def PIV_worker():
 
                 if piv_projection_queue.qsize() < 2: 
                     continue
-
                 m_1 = piv_projection_queue.get().projections["Z"]
-                m_2 = piv_projection_queue.get().projections["Z"]
+                # to compare projections in a consecutive way,
+                # we have to leave the last projection in the piv_projection_queue
+                m_2 = piv_projection_queue.queue[0].projections["Z"]
                 if m_1.shape == m_2.shape:
                     avg_speed = jl.fn(m_1, m_2)
                     avg_speed = round(avg_speed[-1], 3)
