@@ -23,6 +23,7 @@ from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
+from scipy.signal import find_peaks
 import shutil
 import json
 import csv
@@ -231,7 +232,7 @@ def read_image(image_path):
     return False
 
 
-def plane_to_projection(plane, output_dictionary):
+def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
 
     """
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
@@ -302,6 +303,17 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature,
                     projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
             except OSError as err:
                 print(err)
+    if not projections:
+        # assume that we work with max Z projections
+        projections["Z"] = None
+        try:
+            file_name = os.path.basename(file_list[0]).replace('.bmp', '.tif')
+            projection_folder_path = os.path.join(output_dir, f"z_projections")
+            if not os.path.exists(projection_folder_path):
+                os.makedirs(projection_folder_path)
+            projections_files_path["Z"] = os.path.join(projection_folder_path, file_name)
+        except OSError as err:
+            print(err)
     # write data to memory-mapped array
     with tqdm(total=len(file_list), desc="Saving plane") as pbar:
         for z in range(shape[0]):
@@ -646,7 +658,11 @@ def plot_pil_data(piv_data):
         PIV_PLOT_CANVAS.clear()
         PIV_PLOT_CANVAS.set_ylim([0, y_range])
         x, y = zip(*piv_data.items())
+        y = np.asarray(y)
+        peaks, _ = find_peaks(y)
         PIV_PLOT_CANVAS.plot(x, y)
+        if peaks.any():
+            PIV_PLOT_CANVAS.plot(peaks, y[peaks], "x")
         PIV_PLOT_CANVAS.xaxis.set_ticks(x)
         PIV_PLOT_CANVAS.set_xticklabels(x, fontsize=10, rotation=30)
         PIV_PLOT_CANVAS.figure.canvas.draw()
