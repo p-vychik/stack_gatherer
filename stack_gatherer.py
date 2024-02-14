@@ -71,6 +71,7 @@ class NotImagePlaneFile(Exception):
 @dataclass
 class StackSignature:
     total_num_planes: int
+    timelapse_id: str
     time_point: int
     specimen: int
     illumination: int
@@ -82,7 +83,7 @@ class StackSignature:
             return tuple([val for attribute, val in self.__dict__.items() if attribute not in exclude_fields])
         if exclude_fields:
             return tuple([val for attribute, val in self.__dict__.items() if attribute != exclude_fields])
-        return self.total_num_planes, self.time_point, self.specimen, self.illumination, self.camera, self.channel
+        return self.total_num_planes, self.timelapse_id, self.time_point, self.specimen, self.illumination, self.camera, self.channel
 
     def __hash__(self):
         return hash(self.get_attr_excluding())
@@ -90,6 +91,12 @@ class StackSignature:
     @property
     def signature(self):
         return self.get_attr_excluding()
+    
+    @property
+    def signature_no_time(self):
+        return self.get_attr_excluding(exclude_fields=["time_point"])
+    
+
 
 
 @dataclass
@@ -123,6 +130,7 @@ class ImageFile:
     :param file_path: full path to image
     :type file_path: str
     """
+    timelapse_id = ""
     time_point = 0
     specimen = 0
     illumination = 0
@@ -137,28 +145,30 @@ class ImageFile:
     def __init__(self, file_path):
         self.path_to_image_dir = os.path.dirname(file_path)
         file_name = os.path.basename(file_path)
-        split_by = r"TP-|SPC-|ILL-|CAM-|CH-|PL-|outOf-|\."
+        split_by = r"timelapseID-|TP-|SPC-|ILL-|CAM-|CH-|PL-|outOf-|\."
         name_parts = re.split(split_by, file_name)
         
-        if len(name_parts) == 9:
+        if len(name_parts) == 10:
             try:
                 for i, name_part in enumerate(name_parts):
                     
                     if i == 0:
                         self.dataset_name = name_part.strip("-_")
                     elif i == 1:
-                        self.time_point = int(name_part.strip("-_"))
+                        self.timelapse_id = name_part.strip("-_")
                     elif i == 2:
-                        self.specimen = int(name_part.strip("-_"))
+                        self.time_point = int(name_part.strip("-_"))
                     elif i == 3:
-                        self.illumination = int(name_part.strip("-_"))
+                        self.specimen = int(name_part.strip("-_"))
                     elif i == 4:
-                        self.camera = int(name_part.strip("-_"))
+                        self.illumination = int(name_part.strip("-_"))
                     elif i == 5:
-                        self.channel = int(name_part.strip("-_"))
+                        self.camera = int(name_part.strip("-_"))
                     elif i == 6:
-                        self.plane = int(name_part.strip("-_"))
+                        self.channel = int(name_part.strip("-_"))
                     elif i == 7:
+                        self.plane = int(name_part.strip("-_"))
+                    elif i == 8:
                         name_and_info = name_part.strip("-_").split("_", 1)
                         if len(name_and_info) == 1:
                             self.total_num_planes = int(name_and_info[0].strip("-_"))
@@ -166,7 +176,7 @@ class ImageFile:
                             num_planes, info = name_and_info
                             self.total_num_planes = int(num_planes.strip("-_"))
                             self.additional_info = info
-                    elif i == 8:
+                    elif i == 9:
                         self.extension = name_part
             except ValueError:
                 raise NotImagePlaneFile(
@@ -175,7 +185,7 @@ class ImageFile:
         else:
             raise NotImagePlaneFile(
                 "Image file name is improperly formatted! Check documentation inside the script. "
-                "Expected 8 parts after splitting by %s" % split_by)
+                "Expected 10 parts after splitting by %s" % split_by)
 
         self.extension.lower()
 
@@ -186,7 +196,7 @@ class ImageFile:
             additional_info = "_" + additional_info
         if dataset_name != "":
             dataset_name = dataset_name + "_"
-        return (f"{dataset_name}TP-{self.time_point:04}"
+        return (f"{dataset_name}timelapseID-{self.timelapse_id:}_TP-{self.time_point:04}"
                 f"_SPC-{self.specimen:04}_ILL-{self.illumination}"
                 f"_CAM-{self.camera}_CH-{self.channel:02}"
                 f"_PL-{self.plane:04}-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}" 
@@ -202,7 +212,7 @@ class ImageFile:
             additional_info = "_" + additional_info
         if dataset_name != "":
             dataset_name = dataset_name + "_"
-        return (f"{dataset_name}TP-{self.time_point:04}"
+        return (f"{dataset_name}timelapseID-{self.timelapse_id:}_TP-{self.time_point:04}"
                 f"_SPC-{self.specimen:04}_ILL-{self.illumination}"
                 f"_CAM-{self.camera}_CH-{self.channel:02}"
                 f"_PL-(ZS)-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}" 
@@ -216,6 +226,7 @@ class ImageFile:
     
     def get_stack_signature(self):
         return StackSignature(self.total_num_planes,
+                              self.timelapse_id,
                               self.time_point,
                               self.specimen,
                               self.illumination,
@@ -268,7 +279,7 @@ def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
     return output_dictionary
 
 
-def collect_files_to_one_stack_get_axial_projections(stack_signature,
+def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSignature,
                                                      file_list,
                                                      output_file_path,
                                                      axes=None,
@@ -377,7 +388,7 @@ def add_file_to_active_stacks(image_file: ImageFile):
     return stack_signature
 
 
-def check_stack_and_collect_if_ready(stack_signature, output_dir, axes=None, factor=None):
+def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir, axes=None, factor=None):
     if len(active_stacks[stack_signature.signature]) < stack_signature.total_num_planes:
         return
     # We have to ensure that two events firing at the same time don't start saving the same stack twice
@@ -421,9 +432,11 @@ class MyHandler(FileSystemEventHandler):
         # load json parameters
         if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
             destination_folder = os.path.join(self.output_dir, os.path.basename(file_path).strip(".json"))
+            timestamp = os.path.basename(file_path).strip(".json").split("_")[1]
             lapse_parameters = None
             try:
                 j_file = open(file_path)
+                time.sleep(1)
                 lapse_parameters = json.load(j_file)
                 j_file.close()
             except PermissionError:
@@ -431,19 +444,20 @@ class MyHandler(FileSystemEventHandler):
             if lapse_parameters:
                 lapse_parameters["output_folder"] = destination_folder
                 setup_signature = []
-                # in the filename specimen's index usually starts from 1
-                for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"], start=1):
-                    timepoint = lapse_parameters["timelapse"]["timepoints"]
+                for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
                     total_num_planes = spec_entry["number_of_planes"]
                     for channel_num, channel in enumerate(spec_entry["channels"]):
-                        for camera_num, enabled in enumerate(channel["camerasEnabled"]):
-                            if enabled:
-                                setup_signature.append((total_num_planes,
-                                                        timepoint,
-                                                        specimen_number,
-                                                        channel["illuminationLine"],
-                                                        camera_num,
-                                                        channel_num))
+                        active_illum = channel["lightsheetsEnabled"]
+                        active_illum = [idx for idx, value in enumerate(active_illum) if value]
+                        for illum in active_illum:
+                            for camera_num, enabled in enumerate(channel["camerasEnabled"]):
+                                if enabled:
+                                    setup_signature.append((total_num_planes,
+                                                            timestamp,
+                                                            specimen_number,
+                                                            illum,
+                                                            camera_num,
+                                                            channel_num))
                 JSON_CONFIGS.update(dict.fromkeys(setup_signature, lapse_parameters))
             try:
                 if not os.path.exists(destination_folder):
@@ -469,7 +483,7 @@ class MyHandler(FileSystemEventHandler):
             stack_signature = add_file_to_active_stacks(file)
             # create separate folder for the output based on metadata filename
             try:
-                output_dir = JSON_CONFIGS[stack_signature.signature]["output_folder"]
+                output_dir = JSON_CONFIGS[stack_signature.signature_no_time]["output_folder"]
                 if os.path.exists(output_dir):
                     check_stack_and_collect_if_ready(stack_signature, output_dir, self.axes, self.factor)
             except KeyError:
