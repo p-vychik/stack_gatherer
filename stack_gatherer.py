@@ -236,10 +236,18 @@ class ImageFile:
 
 def read_image(image_path):
     if image_path.endswith((".tif", ".tiff")):
-        return imread(image_path)
+        time.sleep(0.1)
+        try:
+            image = imread(image_path)
+            return image
+        except Exception as error:
+            print(error)
     if image_path.endswith(".bmp"):
-        image = Image.open(image_path)
-        return np.array(image)
+        try:
+            image = Image.open(image_path)
+            return np.array(image)
+        except Exception as error:
+            print(error)
     return False
 
 
@@ -316,7 +324,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                 print(err)
     if not projections:
         # assume that we work with max Z projections
-        projections["Z"] = None
+        projections["Z"] = True
         try:
             file_name = os.path.basename(file_list[0]).replace('.bmp', '.tif')
             projection_folder_path = os.path.join(output_dir, f"z_projections")
@@ -330,6 +338,12 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
         for z in range(shape[0]):
             if z == 0:
                 zyx_stack[z] = sample_image
+                if projections["Z"]:
+                    # that means that input doesn't need processing
+                    projections["Z"] = read_image(file_list[z])
+                    zyx_stack.flush()
+                    pbar.update(1)
+                    break
                 zyx_stack.flush()
                 pbar.update(1)
                 continue
@@ -436,7 +450,7 @@ class MyHandler(FileSystemEventHandler):
             lapse_parameters = None
             try:
                 j_file = open(file_path)
-                time.sleep(1)
+                time.sleep(0.1)
                 lapse_parameters = json.load(j_file)
                 j_file.close()
             except PermissionError:
@@ -478,8 +492,6 @@ class MyHandler(FileSystemEventHandler):
                 except OSError:
                     pass
                 return
-            # while file.get_stack_signature() not in JSON_CONFIGS:
-            #     time.sleep(0.1)
             stack_signature = add_file_to_active_stacks(file)
             # create separate folder for the output based on metadata filename
             try:
@@ -585,6 +597,7 @@ def draw_napari_layer(projections_dict):
 
 
 def update_layer(layers_dict):
+    time.sleep(0.1)
     for axes_names, image in layers_dict.items():
         if axes_names not in VIEWER.layers:
             VIEWER.add_image(image, name=axes_names)
@@ -610,6 +623,7 @@ def merge_multiple_projections(wrapped_dict_list: tuple):
 @thread_worker(connect={'yielded': update_layer})
 def get_projections_dict_from_queue():
     global DRAWN_PROJECTIONS_QUEUE
+    counter = 0
     while True:
         time.sleep(0.2)
         if len(PROJECTIONS_QUEUE) > 0:
@@ -646,6 +660,8 @@ def get_projections_dict_from_queue():
                 else:
                     print("Empty projections dictionary")
             if image_layer_dict:
+                # counter += 1
+                # print(counter)
                 yield image_layer_dict
 
 
@@ -662,25 +678,30 @@ def make_napari_viewer():
     bx.stateChanged.connect(bx_trigger)
     VIEWER.window.add_dock_widget(bx)
     if PIVJLPATH:
-        PIV_PLOT_CANVAS.plot(0,0)
+        PIV_PLOT_CANVAS.plot(0, 0)
         VIEWER.window.add_dock_widget(DYNAMIC_CANVAS, area='bottom', name='PIL data')
 
 
 def plot_pil_data(piv_data):
     if piv_data:
-        y_range = math.ceil(MAX_SPEED * 1.5)
-        PIV_PLOT_CANVAS.clear()
-        PIV_PLOT_CANVAS.set_ylim([0, y_range])
         x, y = zip(*piv_data.items())
-        y = np.asarray(y)
-        peaks, _ = find_peaks(y)
+        if len(x) > 40:
+            x = x[-40::]
+            y = np.array(y[-40::])
+        y_lim_range = (math.floor(min(y) * 0.9), math.ceil(max(y) * 1.1))
+        PIV_PLOT_CANVAS.clear()
+        PIV_PLOT_CANVAS.set_ylim(y_lim_range)
         PIV_PLOT_CANVAS.plot(x, y)
-        if peaks.any():
-            PIV_PLOT_CANVAS.plot(peaks, y[peaks], "x")
+        peaks, _ = find_peaks(y, prominence=1.5)
+        if len(peaks):
+            peaks = peaks.tolist()
+            x_marker = [x[i] for i in peaks]
+            y_marker = [y[i] for i in peaks]
+            PIV_PLOT_CANVAS.plot(x_marker, y_marker, color='red', marker='o', markersize=12, linewidth=0)
         PIV_PLOT_CANVAS.xaxis.set_ticks(x)
-        PIV_PLOT_CANVAS.set_xticklabels(x, fontsize=10, rotation=30)
-        PIV_PLOT_CANVAS.figure.canvas.draw()
-        FIG.tight_layout()
+        PIV_PLOT_CANVAS.set_xticklabels(x, fontsize=10)
+        PIV_PLOT_CANVAS.figure.canvas.draw_idle()
+
 
 
 def PIV_worker():
@@ -688,11 +709,12 @@ def PIV_worker():
         from juliacall import Main as jl
         jl.include(PIVJLPATH)
         global PIL_DATA_STORAGE
-        global MAX_SPEED
         piv_projection_queue = Queue()
+        current_time = 0
         while True:
             time.sleep(0.1)
             if PROCESSED_Z_PROJECTIONS.qsize() >= 2:
+                start_total = time.time()
                 wrapped_z_p_1 = PROCESSED_Z_PROJECTIONS.get()
                 # to calculate avg speed in consecutive way we store
                 # the last projection from every pairwise comparison
@@ -714,18 +736,17 @@ def PIV_worker():
                 # we have to leave the last projection in the piv_projection_queue
                 m_2 = piv_projection_queue.queue[0].projections["Z"]
                 if m_1.shape == m_2.shape:
+                    piv_start = time.time()
                     avg_speed = jl.fn(m_1, m_2)
+                    print(f"Piv run: {time.time() - piv_start}")
                     avg_speed = round(avg_speed[-1], 3)
                     now = datetime.now()
-                    current_time = now.strftime("%H:%M:%S")
-                    if avg_speed:
-                        MAX_SPEED = max(avg_speed, MAX_SPEED)
+                    # current_time = now.strftime("%H:%M:%S")
+                    current_time += 1
                     PIL_DATA_STORAGE[current_time] = avg_speed
-                    if len(PIL_DATA_STORAGE) > 15:
-                        # PIL_DATA_STORAGE.popitem(last=False)
-                        plot_pil_data(PIL_DATA_STORAGE[-15::])
-                    else:
+                    if PIL_DATA_STORAGE:
                         plot_pil_data(PIL_DATA_STORAGE)
+                        print(f"Total run: {time.time()-start_total}")
                 else:
                     print("Projections should have the same size for QuickPIV input")
 
@@ -773,12 +794,12 @@ def main():
                 print(e)
 
     make_napari_viewer()
+    thread = Thread(target=run_the_loop, args=(vars(args), ))
+    thread.start()
+    get_projections_dict_from_queue()
     if PIVJLPATH:
         piv_worker_thread = Thread(target=PIV_worker)
         piv_worker_thread.start()
-    get_projections_dict_from_queue()
-    thread = Thread(target=run_the_loop, args=(vars(args), ))
-    thread.start()
     napari.run()
     thread.join()
 
