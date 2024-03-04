@@ -45,7 +45,6 @@ BORDER_WIDTH = 20
 MAX_SPEED = 1
 PROCESSED_Z_PROJECTIONS = Queue()
 PROJECTIONS_QUEUE = OrderedDict()
-DRAWN_PROJECTIONS_QUEUE = OrderedDict()
 JSON_CONFIGS = {}
 MERGE_LIGHT_MODES = False
 VIEWER = None
@@ -369,8 +368,8 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
         if "Z" in projections:
             # push to the queue for PIV calculations
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
-            PROCESSED_Z_PROJECTIONS.put(wrapped_z_projection)
-            # PROCESSED_Z_PROJECTIONS.put(projections["Z"])
+            if PIVJLPATH:
+                PROCESSED_Z_PROJECTIONS.put(wrapped_z_projection)
 
         for axis in projections.keys():
             try:
@@ -622,32 +621,31 @@ def merge_multiple_projections(wrapped_dict_list: tuple):
 
 @thread_worker(connect={'yielded': update_layer})
 def get_projections_dict_from_queue():
-    global DRAWN_PROJECTIONS_QUEUE
-    counter = 0
+    drawn_projections_queue = OrderedDict()
     while True:
         time.sleep(0.2)
         if len(PROJECTIONS_QUEUE) > 0:
             image_layer_dict = {}
             # store last 4 projections drawn in napari layer for merging channels purpose
-            if len(DRAWN_PROJECTIONS_QUEUE) > 4:
-                DRAWN_PROJECTIONS_QUEUE.popitem(last=False)
+            if len(drawn_projections_queue) > 4:
+                drawn_projections_queue.popitem(last=False)
             identifier, projections_dict_list = PROJECTIONS_QUEUE.popitem(last=False)
             if MERGE_LIGHT_MODES:
                 # should check the number of illuminations
                 if len(projections_dict_list) == 2:
                     merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
                     image_layer_dict = draw_napari_layer(merged_projections_dict)
-                elif identifier in DRAWN_PROJECTIONS_QUEUE and projections_dict_list:
-                    projections_dict_list.extend(DRAWN_PROJECTIONS_QUEUE[identifier])
+                elif identifier in drawn_projections_queue and projections_dict_list:
+                    projections_dict_list.extend(drawn_projections_queue[identifier])
                     merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
                     image_layer_dict = draw_napari_layer(merged_projections_dict)
-                    del DRAWN_PROJECTIONS_QUEUE[identifier]
+                    del drawn_projections_queue[identifier]
                 elif projections_dict_list:
                     for wrapped_dict in projections_dict_list:
                         channel_layer = draw_napari_layer(wrapped_dict.projections)
                         for key, val in channel_layer.items():
                             image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
-                    DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
+                    drawn_projections_queue[identifier] = list(projections_dict_list)
             else:
                 if projections_dict_list:
                     # iterate through the list, assign illumination index to the axis, save all to the new ,
@@ -656,12 +654,10 @@ def get_projections_dict_from_queue():
                         channel_layer = draw_napari_layer(wrapped_dict.projections)
                         for key, val in channel_layer.items():
                             image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
-                    DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
+                    drawn_projections_queue[identifier] = list(projections_dict_list)
                 else:
                     print("Empty projections dictionary")
             if image_layer_dict:
-                # counter += 1
-                # print(counter)
                 yield image_layer_dict
 
 
