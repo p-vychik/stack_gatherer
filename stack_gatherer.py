@@ -235,7 +235,6 @@ class ImageFile:
 
 def read_image(image_path):
     if image_path.endswith((".tif", ".tiff")):
-        time.sleep(0.1)
         try:
             image = imread(image_path)
             return image
@@ -244,6 +243,14 @@ def read_image(image_path):
     if image_path.endswith(".bmp"):
         try:
             image = Image.open(image_path)
+            if image.mode == "RGB":
+                height, width = image.size
+                with open(image_path, 'rb') as img_bytes:
+                    data = img_bytes.read()
+                    header_len = len(data) - height * width * 2
+                    no_header_data = data[header_len:]
+                    image = Image.frombytes('I;16', (width, height), no_header_data, 'raw')
+                return np.asarray(image, dtype="uint16")
             return np.array(image)
         except Exception as error:
             print(error)
@@ -307,20 +314,17 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
     projections = {}
     projections_files_path = {}
     if axes:
-        if ',' in axes:
-            projections = {axis.upper(): None for axis in set(axes) if axis in "zZxXyY"}
-        if axes in "zZxXyY":
-            projections = {axes.upper().strip(): None}
-        if projections:
-            try:
-                file_name = os.path.basename(file_list[0]).replace('.bmp', '.tif')
-                for axis in projections.keys():
-                    projection_folder_path = os.path.join(output_dir, f"{axis}_projections")
-                    if not os.path.exists(projection_folder_path):
-                        os.makedirs(projection_folder_path)
-                    projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
-            except OSError as err:
-                print(err)
+        projections = {axis.upper(): None for axis in set(axes) if axis in "zZxXyY"}
+    if projections:
+        try:
+            file_name = os.path.basename(file_list[0]).replace('.bmp', '.tif')
+            for axis in projections.keys():
+                projection_folder_path = os.path.join(output_dir, f"{axis}_projections")
+                if not os.path.exists(projection_folder_path):
+                    os.makedirs(projection_folder_path)
+                projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
+        except OSError as err:
+            print(err)
     if not projections:
         # assume that we work with max Z projections
         projections["Z"] = True
@@ -752,20 +756,20 @@ def main():
     parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif or .bmp "
                                                  "files as stacks to output directory.")
     # Define the input_folder argument
-    parser.add_argument('-i', '--input', required=True, help="Input folder path to watch.")
+    parser.add_argument('--input', required=True, help="Input folder path to watch.")
     
     # Define the output_folder argument
-    parser.add_argument('-o', '--output', required=True, help="Output folder path to save stacks.")
+    parser.add_argument('--output', required=True, help="Output folder path to save stacks.")
 
     # Define axes to make projections
-    parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project "
+    parser.add_argument('--axes', required=False, help="Comma separated axes to project "
                                                              "on the plane, i.e. X,Y,Z or X, or X")
 
     # Anisotropy factor correction
-    parser.add_argument('-f', '--factor_anisotropy', required=True if '-a' in sys.argv else False,
+    parser.add_argument('--factor_anisotropy', required=True if '-a' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
     # Move image files with incorrect name to the user provided directory
-    parser.add_argument('-d', '--temp_dir', required=True,
+    parser.add_argument('--temp_dir', required=True,
                         help="Directory path to store input images with incorrect file name")
     parser.add_argument('--pivjl', required=False, default=False,
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
