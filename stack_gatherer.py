@@ -17,50 +17,95 @@ from tqdm import tqdm
 import threading
 from PIL import Image
 import napari
-from napari.qt.threading import thread_worker
 from threading import Thread
 from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
-from scipy.signal import find_peaks
 import shutil
 import json
 import csv
-# for PIV results visualisation with matplotlib
-from matplotlib.backends.backend_qt5agg import FigureCanvas
-from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from matplotlib import style
 from datetime import datetime
-np.set_printoptions(threshold=np.inf)
+import random
+import multiprocessing
+import traceback
+from multiprocessing import Manager, Event
+from MainWindow import Ui_MainWindow
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import QApplication, QMainWindow
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 ACQUISITION_META_FILE_PATTERN = "AcquisitionMetadata_"
 # BORDER_WIDTH defines the size of the border in pixels between
 # projections merged in one image for napari visualization
 BORDER_WIDTH = 20
-# queue for storing dictionaries with projections generated in collect_files_to_one_stack_get_axial_projections()
-MAX_SPEED = 1
-PROCESSED_Z_PROJECTIONS = Queue()
+PROCESSED_Z_PROJECTIONS = multiprocessing.Queue()
 PROJECTIONS_QUEUE = OrderedDict()
+DRAWN_PROJECTIONS_QUEUE = OrderedDict()
 JSON_CONFIGS = {}
 MERGE_LIGHT_MODES = False
+# napari viewer window
 VIEWER = None
-TEMP_DIR = None
+# matplotlib widget window
+PLT_WIDGET_WINDOW = None
+TEMP_DIR = ""
 PIVJLPATH = ""
-plt.rcParams.update({'figure.autolayout': True})
-style.use('fivethirtyeight')
-FIG = plt.figure()
-DYNAMIC_CANVAS = FigureCanvas(Figure(figsize=(5, 3)))
-# added due to UserWarning: Tight layout not applied
 
-PIV_PLOT_CANVAS = DYNAMIC_CANVAS.figure.subplots()
-PIL_DATA_STORAGE = OrderedDict()
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
+
+LAYERS_INPUT = multiprocessing.Queue()
+PIV_OUTPUT = multiprocessing.Queue()
+
+
+# Define the main window class
+class MainWindow(QMainWindow, Ui_MainWindow):
+    def __init__(self):
+        super().__init__()
+        # Initialize GUI
+        self.setupUi(self)
+
+    def closeEvent(self, event):
+        self.close()
+        app.quit()
+
+    def plot_curve(self, x, y, x_marker, y_marker):
+        # Plot a curve:
+        self.plotWidget.canvas.axes.clear()
+        y_lim_range = (math.floor(min(y) * 0.9), math.ceil(max(y) * 1.1))
+        self.plotWidget.canvas.axes.set_ylim(y_lim_range)
+        self.plotWidget.canvas.axes.plot(x, y, color='blue')
+        if x_marker and y_marker:
+            self.plotWidget.canvas.axes.plot(x_marker, y_marker,
+                                             color='red', marker='o',
+                                             markersize=12, linewidth=0)
+        self.plotWidget.canvas.axes.set_xticks(x)
+        self.plotWidget.canvas.axes.set_xticklabels(x, fontsize=10)
+        self.plotWidget.canvas.draw()
+
+
+class PivProcess(multiprocessing.Process):
+    def __init__(self, *args, **kwargs):
+        multiprocessing.Process.__init__(self, *args, **kwargs)
+        self._pconn, self._cconn = multiprocessing.Pipe()
+        self._exception = None
+
+    def run(self):
+        try:
+            multiprocessing.Process.run(self)
+            self._cconn.send(None)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self._cconn.send((e, tb))
+
+    @property
+    def exception(self):
+        if self._pconn.poll():
+            self._exception = self._pconn.recv()
+            print(self._exception[0])
+        return self._exception
 
 
 class NotImagePlaneFile(Exception):
@@ -82,7 +127,8 @@ class StackSignature:
             return tuple([val for attribute, val in self.__dict__.items() if attribute not in exclude_fields])
         if exclude_fields:
             return tuple([val for attribute, val in self.__dict__.items() if attribute != exclude_fields])
-        return self.total_num_planes, self.timelapse_id, self.time_point, self.specimen, self.illumination, self.camera, self.channel
+        return (self.total_num_planes, self.timelapse_id, self.time_point, self.specimen,
+                self.illumination, self.camera, self.channel)
 
     def __hash__(self):
         return hash(self.get_attr_excluding())
@@ -90,12 +136,10 @@ class StackSignature:
     @property
     def signature(self):
         return self.get_attr_excluding()
-    
+
     @property
     def signature_no_time(self):
         return self.get_attr_excluding(exclude_fields=["time_point"])
-    
-
 
 
 @dataclass
@@ -146,11 +190,11 @@ class ImageFile:
         file_name = os.path.basename(file_path)
         split_by = r"timelapseID-|TP-|SPC-|ILL-|CAM-|CH-|PL-|outOf-|\."
         name_parts = re.split(split_by, file_name)
-        
+
         if len(name_parts) == 10:
             try:
                 for i, name_part in enumerate(name_parts):
-                    
+
                     if i == 0:
                         self.dataset_name = name_part.strip("-_")
                     elif i == 1:
@@ -198,7 +242,7 @@ class ImageFile:
         return (f"{dataset_name}timelapseID-{self.timelapse_id:}_TP-{self.time_point:04}"
                 f"_SPC-{self.specimen:04}_ILL-{self.illumination}"
                 f"_CAM-{self.camera}_CH-{self.channel:02}"
-                f"_PL-{self.plane:04}-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}" 
+                f"_PL-{self.plane:04}-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}"
                 )
 
     def get_name_without_extension(self):
@@ -214,15 +258,15 @@ class ImageFile:
         return (f"{dataset_name}timelapseID-{self.timelapse_id:}_TP-{self.time_point:04}"
                 f"_SPC-{self.specimen:04}_ILL-{self.illumination}"
                 f"_CAM-{self.camera}_CH-{self.channel:02}"
-                f"_PL-(ZS)-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}" 
+                f"_PL-(ZS)-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}"
                 )
 
     def get_stack_path(self):
         return os.path.join(self.path_to_image_dir, self.get_stack_name())
-    
+
     def get_file_path(self):
         return os.path.join(self.path_to_image_dir, self.get_name())
-    
+
     def get_stack_signature(self):
         return StackSignature(self.total_num_planes,
                               self.timelapse_id,
@@ -235,6 +279,7 @@ class ImageFile:
 
 def read_image(image_path):
     if image_path.endswith((".tif", ".tiff")):
+        time.sleep(0.1)
         try:
             image = imread(image_path)
             return image
@@ -258,7 +303,6 @@ def read_image(image_path):
 
 
 def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
-
     """
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
     As the function output, a modified dictionary is returned that values are numpy arrays with transformed matrices.
@@ -325,24 +369,15 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                 projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
         except OSError as err:
             print(err)
-    if not projections:
-        # assume that we work with max Z projections
-        projections["Z"] = True
-        try:
-            file_name = os.path.basename(file_list[0]).replace('.bmp', '.tif')
-            projection_folder_path = os.path.join(output_dir, f"z_projections")
-            if not os.path.exists(projection_folder_path):
-                os.makedirs(projection_folder_path)
-            projections_files_path["Z"] = os.path.join(projection_folder_path, file_name)
-        except OSError as err:
-            print(err)
     # write data to memory-mapped array
     with tqdm(total=len(file_list), desc="Saving plane") as pbar:
         for z in range(shape[0]):
             if z == 0:
                 zyx_stack[z] = sample_image
-                if projections["Z"]:
-                    # that means that input doesn't need processing
+                if shape[0] == 1:
+                    # stack which consists of one plane means that on input are Z projections,
+                    # clear dictionary to skip processing
+                    projections.clear()
                     projections["Z"] = read_image(file_list[z])
                     zyx_stack.flush()
                     pbar.update(1)
@@ -372,13 +407,12 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
         if "Z" in projections:
             # push to the queue for PIV calculations
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
-            if PIVJLPATH:
-                PROCESSED_Z_PROJECTIONS.put(wrapped_z_projection)
+            PROCESSED_Z_PROJECTIONS.put(wrapped_z_projection)
 
         for axis in projections.keys():
             try:
                 imwrite(projections_files_path[axis], projections[axis])
-            except IOError as err:
+            except Exception as err:
                 print(err)
 
         # we want to store projections derived from planes with different illumination modes to
@@ -395,7 +429,6 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
 
 
 def add_file_to_active_stacks(image_file: ImageFile):
-
     stack_signature = image_file.get_stack_signature()
     if stack_signature.signature not in active_stacks:
         active_stacks[stack_signature.signature] = {}
@@ -427,6 +460,8 @@ def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir
                                                      axes=axes,
                                                      anisotropy_factor=factor,
                                                      output_dir=output_dir)
+    global LAYERS_INPUT
+    LAYERS_INPUT.put(get_projections_dict_from_queue())
     del active_stacks[stack_signature.signature]
     del currenty_saving_stacks_locks[stack_signature.signature]
 
@@ -505,34 +540,62 @@ class MyHandler(FileSystemEventHandler):
                 print("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
 
 
+def update_layer():
+    global LAYERS_INPUT
+    if LAYERS_INPUT.qsize() > 0:
+        data_input = LAYERS_INPUT.get()
+        for axes_names, image in data_input.items():
+            if axes_names not in VIEWER.layers:
+                VIEWER.add_image(image, name=axes_names)
+            else:
+                VIEWER.layers[axes_names].data = image
+
+
 def run_the_loop(kwargs):
+    global PIVJLPATH
     global TEMP_DIR
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
     axes = kwargs.get("axes", "Z")
     factor = kwargs.get("factor_anisotropy", None)
     TEMP_DIR = kwargs.get("temp_dir", None)
-
+    PIVJLPATH = kwargs.get("pivjl", None)
     # Create an observer and attach the event handler
     observer = Observer()
     observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
     # Start the observer
+    stop_process = Event()
     observer.start()
+    manager = Manager()
+    avg_speed_data = manager.dict()
+    migration_detected = multiprocessing.Queue()
     print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
-
+    if PIVJLPATH:
+        worker_p = PivProcess(
+            target=run_piv_process, args=(PROCESSED_Z_PROJECTIONS, PIV_OUTPUT, avg_speed_data, stop_process, PIVJLPATH,
+                                          migration_detected
+                                          ),
+            name='piv_run',
+        )
+        worker_p.start()
     try:
         stop_file = os.path.join(input_dir, STOP_FILE_NAME)
         while (not os.path.exists(stop_file)):
+            if migration_detected.qsize() > 0:
+                frame = migration_detected.get()
+                print(f"Detected on {frame}!")
             time.sleep(1)  # Sleep to keep the script running
     except KeyboardInterrupt:
         # Gracefully stop the observer if the script is interrupted
         observer.stop()
+    if PIVJLPATH:
+        stop_process.set()
     # save PIV data to csv
-    if PIL_DATA_STORAGE:
-        with open(os.path.join(output_dir, "quckPIV_data.csv"), 'w', newline='') as f_out:
+    if avg_speed_data:
+        with open(os.path.join(output_dir, "quickPIV_data.csv"), 'w', newline='') as f_out:
             w = csv.writer(f_out)
             try:
-                w.writerows(PIL_DATA_STORAGE.items())
+                w.writerows(avg_speed_data.items())
             except IOError:
                 print(f"Attempt to save csv data to {output_dir} failed")
     # Wait for the observer to complete
@@ -599,15 +662,6 @@ def draw_napari_layer(projections_dict):
     return image_dict
 
 
-def update_layer(layers_dict):
-    time.sleep(0.1)
-    for axes_names, image in layers_dict.items():
-        if axes_names not in VIEWER.layers:
-            VIEWER.add_image(image, name=axes_names)
-        else:
-            VIEWER.layers[axes_names].data = image
-
-
 def merge_multiple_projections(wrapped_dict_list: tuple):
     # as an input a list of wrapped dictionaries is provided - check class ProjectionsDictWrapper
     # we have to merge appropriate projections according to the maximum intensity
@@ -623,46 +677,43 @@ def merge_multiple_projections(wrapped_dict_list: tuple):
     return merged_projections
 
 
-@thread_worker(connect={'yielded': update_layer})
 def get_projections_dict_from_queue():
-    drawn_projections_queue = OrderedDict()
-    while True:
-        time.sleep(0.2)
-        if len(PROJECTIONS_QUEUE) > 0:
-            image_layer_dict = {}
-            # store last 4 projections drawn in napari layer for merging channels purpose
-            if len(drawn_projections_queue) > 4:
-                drawn_projections_queue.popitem(last=False)
-            identifier, projections_dict_list = PROJECTIONS_QUEUE.popitem(last=False)
-            if MERGE_LIGHT_MODES:
-                # should check the number of illuminations
-                if len(projections_dict_list) == 2:
-                    merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
-                    image_layer_dict = draw_napari_layer(merged_projections_dict)
-                elif identifier in drawn_projections_queue and projections_dict_list:
-                    projections_dict_list.extend(drawn_projections_queue[identifier])
-                    merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
-                    image_layer_dict = draw_napari_layer(merged_projections_dict)
-                    del drawn_projections_queue[identifier]
-                elif projections_dict_list:
-                    for wrapped_dict in projections_dict_list:
-                        channel_layer = draw_napari_layer(wrapped_dict.projections)
-                        for key, val in channel_layer.items():
-                            image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
-                    drawn_projections_queue[identifier] = list(projections_dict_list)
+    global DRAWN_PROJECTIONS_QUEUE
+    if len(PROJECTIONS_QUEUE) > 0:
+        image_layer_dict = {}
+        # store last 4 projections drawn in napari layer for merging channels purpose
+        if len(DRAWN_PROJECTIONS_QUEUE) > 4:
+            DRAWN_PROJECTIONS_QUEUE.popitem(last=False)
+        identifier, projections_dict_list = PROJECTIONS_QUEUE.popitem(last=False)
+        if MERGE_LIGHT_MODES:
+            # should check the number of illuminations
+            if len(projections_dict_list) == 2:
+                merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
+                image_layer_dict = draw_napari_layer(merged_projections_dict)
+            elif identifier in DRAWN_PROJECTIONS_QUEUE and projections_dict_list:
+                projections_dict_list.extend(DRAWN_PROJECTIONS_QUEUE[identifier])
+                merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
+                image_layer_dict = draw_napari_layer(merged_projections_dict)
+                del DRAWN_PROJECTIONS_QUEUE[identifier]
+            elif projections_dict_list:
+                for wrapped_dict in projections_dict_list:
+                    channel_layer = draw_napari_layer(wrapped_dict.projections)
+                    for key, val in channel_layer.items():
+                        image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
+        else:
+            if projections_dict_list:
+                # iterate through the list, assign illumination index to the axis, save all to the new ,
+                # data remain unmerged - apply merge and push to napari
+                for wrapped_dict in projections_dict_list:
+                    channel_layer = draw_napari_layer(wrapped_dict.projections)
+                    for key, val in channel_layer.items():
+                        image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
             else:
-                if projections_dict_list:
-                    # iterate through the list, assign illumination index to the axis, save all to the new ,
-                    # data remain unmerged - apply merge and push to napari
-                    for wrapped_dict in projections_dict_list:
-                        channel_layer = draw_napari_layer(wrapped_dict.projections)
-                        for key, val in channel_layer.items():
-                            image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
-                    drawn_projections_queue[identifier] = list(projections_dict_list)
-                else:
-                    print("Empty projections dictionary")
-            if image_layer_dict:
-                yield image_layer_dict
+                print("Empty projections dictionary")
+        if image_layer_dict:
+            return image_layer_dict
 
 
 def bx_trigger():
@@ -670,100 +721,119 @@ def bx_trigger():
     MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
 
 
-def make_napari_viewer():
-    global VIEWER
-    VIEWER = napari.Viewer()
+def make_napari_viewer(napari_viewer, matplotlibwidget):
+    napari_viewer = napari.Viewer()
+    matplotlibwidget = MainWindow()
     bx = QCheckBox('Merge illumination channels')
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
-    VIEWER.window.add_dock_widget(bx)
+    napari_viewer.window.add_dock_widget(bx)
     if PIVJLPATH:
-        PIV_PLOT_CANVAS.plot(0, 0)
-        VIEWER.window.add_dock_widget(DYNAMIC_CANVAS, area='bottom', name='PIL data')
+        napari_viewer.window.add_dock_widget(matplotlibwidget, area='bottom', name='PIL data')
+    return (napari_viewer, matplotlibwidget)
 
 
-def plot_pil_data(piv_data):
-    if piv_data:
-        x, y = zip(*piv_data.items())
-        if len(x) > 40:
-            x = x[-40::]
-            y = np.array(y[-40::])
-        y_lim_range = (math.floor(min(y) * 0.9), math.ceil(max(y) * 1.1))
-        PIV_PLOT_CANVAS.clear()
-        PIV_PLOT_CANVAS.set_ylim(y_lim_range)
-        PIV_PLOT_CANVAS.plot(x, y)
-        peaks, _ = find_peaks(y, prominence=1.5)
-        if len(peaks):
-            peaks = peaks.tolist()
-            x_marker = [x[i] for i in peaks]
-            y_marker = [y[i] for i in peaks]
-            PIV_PLOT_CANVAS.plot(x_marker, y_marker, color='red', marker='o', markersize=12, linewidth=0)
-        PIV_PLOT_CANVAS.xaxis.set_ticks(x)
-        PIV_PLOT_CANVAS.set_xticklabels(x, fontsize=10)
-        PIV_PLOT_CANVAS.figure.canvas.draw_idle()
+def run_piv_process(queue_in: multiprocessing.Queue,
+                    queue_out: multiprocessing.Queue,
+                    avg_speed_data: dict,
+                    stop_process: Event,
+                    piv_path: str,
+                    migration_detected: multiprocessing.Queue
+                    ):
 
+    from juliacall import Main as jl
+    from scipy.signal import find_peaks
+    jl.include(piv_path)
+    piv_projection_queue = Queue()
+    projections_to_process = Queue()
+    t = 0
+    x = []
+    y = []
+    while True:
+        if stop_process.is_set():
+            break
+        plane_matrix = queue_in.get()
+        if plane_matrix:
+            projections_to_process.put(plane_matrix)
+        if projections_to_process.qsize() >= 2:
+            wrapped_z_p_1 = projections_to_process.get()
+            # to calculate avg speed in consecutive way we store
+            # the last projection from every pairwise comparison
+            wrapped_z_p_2 = projections_to_process.queue[0]
+            if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
+                merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
+                                                                 (wrapped_z_p_1,
+                                                                  wrapped_z_p_2))
+                                                                )
+                merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
+                                                             wrapped_z_p_2.signature)
+                piv_projection_queue.put(merged_wrapped_proj)
+                projections_to_process.get()
+            else:
+                piv_projection_queue.put(wrapped_z_p_1)
 
-
-def PIV_worker():
-    if PIVJLPATH:
-        from juliacall import Main as jl
-        jl.include(PIVJLPATH)
-        global PIL_DATA_STORAGE
-        piv_projection_queue = Queue()
-        current_time = 0
-        while True:
-            time.sleep(0.1)
-            if PROCESSED_Z_PROJECTIONS.qsize() >= 2:
-                start_total = time.time()
-                wrapped_z_p_1 = PROCESSED_Z_PROJECTIONS.get()
-                # to calculate avg speed in consecutive way we store
-                # the last projection from every pairwise comparison
-                wrapped_z_p_2 = PROCESSED_Z_PROJECTIONS.queue[0]
-                
-                if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
-                    merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
-                                                                     (wrapped_z_p_1, wrapped_z_p_2)))
-                    merged_wrapped_proj = ProjectionsDictWrapper(merged_projections, wrapped_z_p_2.signature)
-                    piv_projection_queue.put(merged_wrapped_proj)
-                    PROCESSED_Z_PROJECTIONS.get()
-                else:
-                    piv_projection_queue.put(wrapped_z_p_1)
-
-                if piv_projection_queue.qsize() < 2: 
-                    continue
-                m_1 = piv_projection_queue.get().projections["Z"]
-                # to compare projections in a consecutive way,
-                # we have to leave the last projection in the piv_projection_queue
-                m_2 = piv_projection_queue.queue[0].projections["Z"]
-                if m_1.shape == m_2.shape:
-                    piv_start = time.time()
+            if piv_projection_queue.qsize() < 2:
+                continue
+            m_1 = piv_projection_queue.get().projections["Z"]
+            # to compare projections in a consecutive way,
+            # we have to leave the last projection in the piv_projection_queue
+            m_2 = piv_projection_queue.queue[0].projections["Z"]
+            if m_1.shape == m_2.shape:
+                try:
                     avg_speed = jl.fn(m_1, m_2)
-                    print(f"Piv run: {time.time() - piv_start}")
                     avg_speed = round(avg_speed[-1], 3)
-                    now = datetime.now()
-                    # current_time = now.strftime("%H:%M:%S")
-                    current_time += 1
-                    PIL_DATA_STORAGE[current_time] = avg_speed
-                    if PIL_DATA_STORAGE:
-                        plot_pil_data(PIL_DATA_STORAGE)
-                        print(f"Total run: {time.time()-start_total}")
-                else:
-                    print("Projections should have the same size for QuickPIV input")
+                except Exception as error:
+                    raise error
+                # current_time = now.strftime("%H:%M:%S")
+                t += 1
+                x.append(t)
+                avg_speed_data[t] = avg_speed
+                try:
+                    y.append(avg_speed)
+                except Exception as error:
+                    raise error
+                if len(x) > 40:
+                    x = x[-40::]
+                    y = y[-40::]
+                try:
+                    peaks, _ = find_peaks(np.asarray(y), prominence=1.5)
+                except Exception as error:
+                    raise error
+                x_marker, y_marker = [], []
+                if len(peaks):
+                    try:
+                        migration_detected.put(t)
+                        peaks = peaks.tolist()
+                        x_marker = [x[i] for i in peaks]
+                        y_marker = [y[i] for i in peaks]
+                    except Exception as error:
+                        raise error
+                queue_out.put((x, y, x_marker, y_marker))
+            else:
+                raise ValueError("Projections should have the same size for QuickPIV input")
+
+
+def update_graph():
+    global PIV_OUTPUT
+    if PIV_OUTPUT.qsize() > 0:
+        x, y, x_marker, y_marker = PIV_OUTPUT.get()
+        PLT_WIDGET_WINDOW.plot_curve(x, y, x_marker, y_marker)
 
 
 def main():
     # Create the argument parser
     parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif or .bmp "
-                                                 "files as stacks to output directory.")
+                                                 "files as stacks to output directory.",
+                                     argument_default=argparse.SUPPRESS)
     # Define the input_folder argument
     parser.add_argument('--input', required=True, help="Input folder path to watch.")
-    
+
     # Define the output_folder argument
     parser.add_argument('--output', required=True, help="Output folder path to save stacks.")
 
     # Define axes to make projections
     parser.add_argument('--axes', required=False, help="Comma separated axes to project "
-                                                             "on the plane, i.e. X,Y,Z or X, or X")
+                                                       "on the plane, i.e. X,Y,Z or X, or X")
 
     # Anisotropy factor correction
     parser.add_argument('--factor_anisotropy', required=True if '-a' in sys.argv else False,
@@ -775,12 +845,9 @@ def main():
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
     parser.add_argument('-debug_run', required=False, default=False, action='store_true',
                         help="All content of --output specified folder will be DELETED!")
-    global PIVJLPATH
+
     # Parse the command-line arguments
     args = parser.parse_args()
-    if args.pivjl:
-        if os.path.isfile(args.pivjl):
-            PIVJLPATH = args.pivjl
     if args.debug_run:
         # for testing purposes only - empty the output folder before loading files
         for filename in os.listdir(args.output):
@@ -792,14 +859,16 @@ def main():
                     shutil.rmtree(file_path)
             except Exception as e:
                 print(e)
-
-    make_napari_viewer()
+    global VIEWER, PLT_WIDGET_WINDOW
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
-    get_projections_dict_from_queue()
-    if PIVJLPATH:
-        piv_worker_thread = Thread(target=PIV_worker)
-        piv_worker_thread.start()
+    VIEWER, PLT_WIDGET_WINDOW = make_napari_viewer(VIEWER, PLT_WIDGET_WINDOW)
+    timer1 = QTimer()
+    timer1.timeout.connect(update_graph)
+    timer1.start(25)
+    timer2 = QTimer()
+    timer2.timeout.connect(update_layer)
+    timer2.start(50)
     napari.run()
     thread.join()
 
