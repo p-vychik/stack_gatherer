@@ -1,6 +1,5 @@
 using PythonCall
-<<<<<<< HEAD
-include("E:/PV/git_repo/multi_quickPIV/src/multi_quickPIV.jl")
+include("replace this message with a path to multi_quickPIV.jl file")
 
 
 function fn(a1, a2)
