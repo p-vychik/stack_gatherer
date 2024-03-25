@@ -6,40 +6,43 @@
 import math
 import argparse
 import sys
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
+import shutil
+import json
+import csv
+import matplotlib.pyplot as plt
 import time
 import os
 import re
 import numpy as np
+import napari
+import random
+import multiprocessing
+import traceback
+import requests
+import threading
 from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
-import threading
 from PIL import Image
-import napari
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 from threading import Thread
 from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
-import shutil
-import json
-import csv
-import matplotlib.pyplot as plt
 from datetime import datetime
-import random
-import multiprocessing
-import traceback
 from multiprocessing import Manager, Event
 from MainWindow import Ui_MainWindow
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QMainWindow
+
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 ACQUISITION_META_FILE_PATTERN = "AcquisitionMetadata_"
 # BORDER_WIDTH defines the size of the border in pixels between
 # projections merged in one image for napari visualization
 BORDER_WIDTH = 20
+PLT_WIDGET_X_AXIS_LENGTH = 40
 PROCESSED_Z_PROJECTIONS = multiprocessing.Queue()
 PROJECTIONS_QUEUE = OrderedDict()
 DRAWN_PROJECTIONS_QUEUE = OrderedDict()
@@ -69,7 +72,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def closeEvent(self, event):
         self.close()
-        app.quit()
 
     def plot_curve(self, x, y, x_marker, y_marker):
         # Plot a curve:
@@ -464,6 +466,13 @@ def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir
     LAYERS_INPUT.put(get_projections_dict_from_queue())
     del active_stacks[stack_signature.signature]
     del currenty_saving_stacks_locks[stack_signature.signature]
+    sample_file_obj
+    # test purpose
+    # time.sleep(0.5)
+    # try:
+    #     os.remove(stack_path)
+    # except Exception as err:
+    #     print(f"failed to remove {err}")
 
 
 # Define the event handler class
@@ -560,16 +569,20 @@ def run_the_loop(kwargs):
     factor = kwargs.get("factor_anisotropy", None)
     TEMP_DIR = kwargs.get("temp_dir", None)
     PIVJLPATH = kwargs.get("pivjl", None)
-    # Create an observer and attach the event handler
-    observer = Observer()
-    observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
-    # Start the observer
-    stop_process = Event()
-    observer.start()
+    bot_config_path = kwargs.get("bot_config", None)
+    TOKEN, CHAT_ID = "", ""
+    if os.path.exists(bot_config_path):
+        with open(bot_config_path) as fin:
+            try:
+                line = fin.readline()
+                TOKEN, CHAT_ID = line.strip().split(" ")
+            except Exception as err:
+                print(err)
+    # start quickPIV process
     manager = Manager()
     avg_speed_data = manager.dict()
     migration_detected = multiprocessing.Queue()
-    print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
+    stop_process = Event()
     if PIVJLPATH:
         worker_p = PivProcess(
             target=run_piv_process, args=(PROCESSED_Z_PROJECTIONS, PIV_OUTPUT, avg_speed_data, stop_process, PIVJLPATH,
@@ -578,12 +591,25 @@ def run_the_loop(kwargs):
             name='piv_run',
         )
         worker_p.start()
+    # Create an observer and attach the event handler
+    observer = Observer()
+    observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
+    # Start the observer
+    observer.start()
+    print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
+
     try:
         stop_file = os.path.join(input_dir, STOP_FILE_NAME)
         while (not os.path.exists(stop_file)):
             if migration_detected.qsize() > 0:
                 frame = migration_detected.get()
-                print(f"Detected on {frame}!")
+                message = f"Detected on {frame}!"
+                if TOKEN and CHAT_ID:
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={CHAT_ID}&text={message}&disable_web_page_preview=true"
+                    response = requests.get(url)
+                    if response.status_code != 200:
+                        print(response.text)
+                print(message)
             time.sleep(1)  # Sleep to keep the script running
     except KeyboardInterrupt:
         # Gracefully stop the observer if the script is interrupted
@@ -746,6 +772,7 @@ def run_piv_process(queue_in: multiprocessing.Queue,
     jl.include(piv_path)
     piv_projection_queue = Queue()
     projections_to_process = Queue()
+    migration_event_frame = set()
     t = 0
     x = []
     y = []
@@ -792,9 +819,9 @@ def run_piv_process(queue_in: multiprocessing.Queue,
                     y.append(avg_speed)
                 except Exception as error:
                     raise error
-                if len(x) > 40:
-                    x = x[-40::]
-                    y = y[-40::]
+                if len(x) > PLT_WIDGET_X_AXIS_LENGTH:
+                    x = x[-PLT_WIDGET_X_AXIS_LENGTH::]
+                    y = y[-PLT_WIDGET_X_AXIS_LENGTH::]
                 try:
                     peaks, _ = find_peaks(np.asarray(y), prominence=1.5)
                 except Exception as error:
@@ -802,10 +829,17 @@ def run_piv_process(queue_in: multiprocessing.Queue,
                 x_marker, y_marker = [], []
                 if len(peaks):
                     try:
-                        migration_detected.put(t)
                         peaks = peaks.tolist()
                         x_marker = [x[i] for i in peaks]
                         y_marker = [y[i] for i in peaks]
+                        if len(x) > PLT_WIDGET_X_AXIS_LENGTH:
+                            global_peaks_indicies = [x + t - PLT_WIDGET_X_AXIS_LENGTH + 1 for x in x_marker]
+                        else:
+                            global_peaks_indicies = x_marker
+                        for frame in global_peaks_indicies:
+                            if frame not in migration_event_frame:
+                                migration_event_frame.add(frame)
+                                migration_detected.put(frame)
                     except Exception as error:
                         raise error
                 queue_out.put((x, y, x_marker, y_marker))
@@ -843,6 +877,9 @@ def main():
                         help="Directory path to store input images with incorrect file name")
     parser.add_argument('--pivjl', required=False, default=False,
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
+    parser.add_argument('--bot_config', required=False, default=False,
+                        help="Path to text file with TOKEN and chat_id information (one line, space separator) for"
+                             " supplying peaks detection on telegram messenger")
     parser.add_argument('-debug_run', required=False, default=False, action='store_true',
                         help="All content of --output specified folder will be DELETED!")
 
