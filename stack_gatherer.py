@@ -291,7 +291,7 @@ def read_image(image_path):
         try:
             image = Image.open(image_path)
             if image.mode == "RGB":
-                height, width = image.size
+                width, height = image.size
                 with open(image_path, 'rb') as img_bytes:
                     data = img_bytes.read()
                     header_len = len(data) - height * width * 2
