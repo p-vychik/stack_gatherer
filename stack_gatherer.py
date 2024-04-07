@@ -43,15 +43,14 @@ ACQUISITION_META_FILE_PATTERN = "AcquisitionMetadata_"
 # projections merged in one image for napari visualization
 BORDER_WIDTH = 20
 PLT_WIDGET_X_AXIS_LENGTH = 40
-PROCESSED_Z_PROJECTIONS = multiprocessing.Queue()
 PROJECTIONS_QUEUE = OrderedDict()
 DRAWN_PROJECTIONS_QUEUE = OrderedDict()
 JSON_CONFIGS = {}
 MERGE_LIGHT_MODES = False
 # napari viewer window
 VIEWER = None
-# matplotlib widget window
-PLT_WIDGET_WINDOW = None
+# separate matplotlib windows for each specimen
+PLT_WIDGETS_DICT = {}
 TEMP_DIR = ""
 PIVJLPATH = ""
 
@@ -65,10 +64,14 @@ PIV_OUTPUT = multiprocessing.Queue()
 
 # Define the main window class
 class MainWindow(QMainWindow, Ui_MainWindow):
+    window_index = 0
+
     def __init__(self):
         super().__init__()
         # Initialize GUI
         self.setupUi(self)
+        MainWindow.window_index += 1
+        self.setWindowTitle(f"QuickPIV average speed, specimen #{self.window_index}")
 
     def closeEvent(self, event):
         self.close()
@@ -132,15 +135,15 @@ class StackSignature:
         return (self.total_num_planes, self.timelapse_id, self.time_point, self.specimen,
                 self.illumination, self.camera, self.channel)
 
-    def __hash__(self):
+    def __hash__(self) -> hash:
         return hash(self.get_attr_excluding())
 
     @property
-    def signature(self):
+    def signature(self) -> tuple:
         return self.get_attr_excluding()
 
     @property
-    def signature_no_time(self):
+    def signature_no_time(self) -> tuple:
         return self.get_attr_excluding(exclude_fields=["time_point"])
 
 
@@ -342,6 +345,7 @@ def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
 def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSignature,
                                                      file_list,
                                                      output_file_path,
+                                                     shared_dict,
                                                      axes=None,
                                                      anisotropy_factor=1,
                                                      output_dir=None):
@@ -409,8 +413,11 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
         if "Z" in projections:
             # push to the queue for PIV calculations
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
-            PROCESSED_Z_PROJECTIONS.put(wrapped_z_projection)
-
+            # here we should put the projection with clear identification of species and other parameters
+            if stack_signature.specimen in shared_dict:
+                shared_dict[stack_signature.specimen].put(wrapped_z_projection)
+            else:
+                print(f"Specimen signature not found in shared queue, signature: {stack_signature}")
         for axis in projections.keys():
             try:
                 imwrite(projections_files_path[axis], projections[axis])
@@ -440,7 +447,7 @@ def add_file_to_active_stacks(image_file: ImageFile):
     return stack_signature
 
 
-def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir, axes=None, factor=None):
+def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir, shared_dict, axes=None, factor=None):
     if len(active_stacks[stack_signature.signature]) < stack_signature.total_num_planes:
         return
     # We have to ensure that two events firing at the same time don't start saving the same stack twice
@@ -459,20 +466,15 @@ def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir
     collect_files_to_one_stack_get_axial_projections(stack_signature,
                                                      file_list,
                                                      stack_path,
+                                                     shared_dict,
                                                      axes=axes,
                                                      anisotropy_factor=factor,
-                                                     output_dir=output_dir)
+                                                     output_dir=output_dir
+                                                     )
     global LAYERS_INPUT
     LAYERS_INPUT.put(get_projections_dict_from_queue())
     del active_stacks[stack_signature.signature]
     del currenty_saving_stacks_locks[stack_signature.signature]
-    sample_file_obj
-    # test purpose
-    # time.sleep(0.5)
-    # try:
-    #     os.remove(stack_path)
-    # except Exception as err:
-    #     print(f"failed to remove {err}")
 
 
 # Define the event handler class
@@ -481,10 +483,12 @@ class MyHandler(FileSystemEventHandler):
     factor = 1
     axes = ""
 
-    def __init__(self, output_dir, factor, axes):
+    def __init__(self, output_dir, factor, axes, shared_dict, json_dict):
         self.output_dir = output_dir
         self.factor = int(factor)
         self.axes = axes
+        self.shared_dict = shared_dict
+        self.json_dict = json_dict
 
     def on_created(self, event):
         if event.is_directory:
@@ -519,7 +523,7 @@ class MyHandler(FileSystemEventHandler):
                                                             illum,
                                                             camera_num,
                                                             channel_num))
-                JSON_CONFIGS.update(dict.fromkeys(setup_signature, lapse_parameters))
+                self.json_dict.update(dict.fromkeys(setup_signature, lapse_parameters))
             try:
                 if not os.path.exists(destination_folder):
                     os.mkdir(destination_folder)
@@ -542,9 +546,13 @@ class MyHandler(FileSystemEventHandler):
             stack_signature = add_file_to_active_stacks(file)
             # create separate folder for the output based on metadata filename
             try:
-                output_dir = JSON_CONFIGS[stack_signature.signature_no_time]["output_folder"]
+                output_dir = self.json_dict[stack_signature.signature_no_time]["output_folder"]
                 if os.path.exists(output_dir):
-                    check_stack_and_collect_if_ready(stack_signature, output_dir, self.axes, self.factor)
+                    check_stack_and_collect_if_ready(stack_signature,
+                                                     output_dir,
+                                                     self.shared_dict,
+                                                     self.axes,
+                                                     self.factor)
             except KeyError:
                 print("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
 
@@ -563,6 +571,7 @@ def update_layer():
 def run_the_loop(kwargs):
     global PIVJLPATH
     global TEMP_DIR
+
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
     axes = kwargs.get("axes", "Z")
@@ -570,30 +579,53 @@ def run_the_loop(kwargs):
     TEMP_DIR = kwargs.get("temp_dir", None)
     PIVJLPATH = kwargs.get("pivjl", None)
     bot_config_path = kwargs.get("bot_config", None)
-    TOKEN, CHAT_ID = "", ""
+    specimen_quantity = kwargs.get("specimen_quantity", None)
+    token, chat_id = "", ""
+
+    manager = Manager()
+    shared_queues_of_z_projections = manager.dict()
+    json_config = manager.dict()
+    if specimen_quantity:
+        shared_queues_of_z_projections = manager.dict()
+        for i in range(0, specimen_quantity):
+            shared_queues_of_z_projections[i] = manager.Queue()
     if os.path.exists(bot_config_path):
         with open(bot_config_path) as fin:
             try:
                 line = fin.readline()
-                TOKEN, CHAT_ID = line.strip().split(" ")
+                token, chat_id = line.strip().split(" ")
             except Exception as err:
                 print(err)
-    # start quickPIV process
-    manager = Manager()
     avg_speed_data = manager.dict()
-    migration_detected = multiprocessing.Queue()
+    # migration_detected = multiprocessing.Queue()
+    migration_detected = manager.Queue()
     stop_process = Event()
-    if PIVJLPATH:
-        worker_p = PivProcess(
-            target=run_piv_process, args=(PROCESSED_Z_PROJECTIONS, PIV_OUTPUT, avg_speed_data, stop_process, PIVJLPATH,
-                                          migration_detected
-                                          ),
-            name='piv_run',
-        )
-        worker_p.start()
+    piv_processes = []
+    # start quickPIV process
+    if PIVJLPATH and specimen_quantity:
+        for index in range(0, specimen_quantity):
+            piv_process = PivProcess(
+                target=run_piv_process, args=(shared_queues_of_z_projections,
+                                              PIV_OUTPUT,
+                                              avg_speed_data,
+                                              stop_process,
+                                              PIVJLPATH,
+                                              migration_detected,
+                                              index
+                                              ),
+                name='piv_run',
+            )
+            piv_processes.append(piv_process)
+            piv_process.start()
     # Create an observer and attach the event handler
     observer = Observer()
-    observer.schedule(MyHandler(output_dir=output_dir, factor=factor, axes=axes), path=input_dir, recursive=False)
+    observer.schedule(MyHandler(output_dir=output_dir,
+                                factor=factor,
+                                axes=axes,
+                                shared_dict=shared_queues_of_z_projections,
+                                json_dict=json_config),
+                      path=input_dir,
+                      recursive=False)
     # Start the observer
     observer.start()
     print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
@@ -602,13 +634,14 @@ def run_the_loop(kwargs):
         stop_file = os.path.join(input_dir, STOP_FILE_NAME)
         while (not os.path.exists(stop_file)):
             if migration_detected.qsize() > 0:
-                frame = migration_detected.get()
-                message = f"Detected on {frame}!"
-                if TOKEN and CHAT_ID:
-                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={CHAT_ID}&text={message}&disable_web_page_preview=true"
+                migration_event = migration_detected.get()
+                message = f"Detected on {migration_event}!"
+                if token and chat_id:
+                    url = (f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={message}&disable_web_page_preview=true")
                     response = requests.get(url)
                     if response.status_code != 200:
                         print(response.text)
+                        print(url)
                 print(message)
             time.sleep(1)  # Sleep to keep the script running
     except KeyboardInterrupt:
@@ -747,24 +780,27 @@ def bx_trigger():
     MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
 
 
-def make_napari_viewer(napari_viewer, matplotlibwidget):
+def make_napari_viewer(napari_viewer, windows_dict, specimen_quantity):
     napari_viewer = napari.Viewer()
-    matplotlibwidget = MainWindow()
     bx = QCheckBox('Merge illumination channels')
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     napari_viewer.window.add_dock_widget(bx)
-    if PIVJLPATH:
-        napari_viewer.window.add_dock_widget(matplotlibwidget, area='bottom', name='PIL data')
-    return (napari_viewer, matplotlibwidget)
+    if PIVJLPATH and specimen_quantity:
+        for i in range(0, specimen_quantity):
+            windows_dict[i] = MainWindow()
+            windows_dict[i].show()
+    # napari_viewer.window.add_dock_widget(matplotlibwidget, area='bottom', name='')
+    return napari_viewer, windows_dict
 
 
-def run_piv_process(queue_in: multiprocessing.Queue,
+def run_piv_process(shared_dict_queue: dict,
                     queue_out: multiprocessing.Queue,
                     avg_speed_data: dict,
                     stop_process: Event,
                     piv_path: str,
-                    migration_detected: multiprocessing.Queue
+                    migration_detected: multiprocessing.Queue,
+                    queue_number: int
                     ):
 
     from juliacall import Main as jl
@@ -773,6 +809,7 @@ def run_piv_process(queue_in: multiprocessing.Queue,
     piv_projection_queue = Queue()
     projections_to_process = Queue()
     migration_event_frame = set()
+    queue_in = shared_dict_queue[queue_number]
     t = 0
     x = []
     y = []
@@ -833,16 +870,16 @@ def run_piv_process(queue_in: multiprocessing.Queue,
                         x_marker = [x[i] for i in peaks]
                         y_marker = [y[i] for i in peaks]
                         if len(x) > PLT_WIDGET_X_AXIS_LENGTH:
-                            global_peaks_indicies = [x + t - PLT_WIDGET_X_AXIS_LENGTH + 1 for x in x_marker]
+                            global_peaks_indices = [x + t - PLT_WIDGET_X_AXIS_LENGTH + 1 for x in x_marker]
                         else:
-                            global_peaks_indicies = x_marker
-                        for frame in global_peaks_indicies:
+                            global_peaks_indices = x_marker
+                        for frame in global_peaks_indices:
                             if frame not in migration_event_frame:
                                 migration_event_frame.add(frame)
-                                migration_detected.put(frame)
+                                migration_detected.put(f"{frame}, specimen {queue_number + 1}")
                     except Exception as error:
                         raise error
-                queue_out.put((x, y, x_marker, y_marker))
+                queue_out.put((queue_number, x, y, x_marker, y_marker))
             else:
                 raise ValueError("Projections should have the same size for QuickPIV input")
 
@@ -850,8 +887,11 @@ def run_piv_process(queue_in: multiprocessing.Queue,
 def update_graph():
     global PIV_OUTPUT
     if PIV_OUTPUT.qsize() > 0:
-        x, y, x_marker, y_marker = PIV_OUTPUT.get()
-        PLT_WIDGET_WINDOW.plot_curve(x, y, x_marker, y_marker)
+        index, x, y, x_marker, y_marker = PIV_OUTPUT.get()
+        try:
+            PLT_WIDGETS_DICT[index].plot_curve(x, y, x_marker, y_marker)
+        except KeyError:
+            print(f"window with index {index} doesn't exist")
 
 
 def main():
@@ -870,15 +910,18 @@ def main():
                                                        "on the plane, i.e. X,Y,Z or X, or X")
 
     # Anisotropy factor correction
-    parser.add_argument('--factor_anisotropy', required=True if '-a' in sys.argv else False,
+    parser.add_argument('--factor_anisotropy', type=int, required=True if '--axes' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
+    # Specimen quantity
+    parser.add_argument('--specimen_quantity', type=int, required=True if '--pivjl' in sys.argv else False,
+                        help="Value for number of specimens in the stage, defines number of plotting windows")
     # Move image files with incorrect name to the user provided directory
     parser.add_argument('--temp_dir', required=True,
                         help="Directory path to store input images with incorrect file name")
     parser.add_argument('--pivjl', required=False, default=False,
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
     parser.add_argument('--bot_config', required=False, default=False,
-                        help="Path to text file with TOKEN and chat_id information (one line, space separator) for"
+                        help="Path to text file with token and chat_id information (one line, space separator) for"
                              " supplying peaks detection on telegram messenger")
     parser.add_argument('-debug_run', required=False, default=False, action='store_true',
                         help="All content of --output specified folder will be DELETED!")
@@ -896,10 +939,10 @@ def main():
                     shutil.rmtree(file_path)
             except Exception as e:
                 print(e)
-    global VIEWER, PLT_WIDGET_WINDOW
+    global VIEWER, PLT_WIDGETS_DICT
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
-    VIEWER, PLT_WIDGET_WINDOW = make_napari_viewer(VIEWER, PLT_WIDGET_WINDOW)
+    VIEWER, PLT_WIDGETS_DICT = make_napari_viewer(VIEWER, PLT_WIDGETS_DICT, args.specimen_quantity)
     timer1 = QTimer()
     timer1.timeout.connect(update_graph)
     timer1.start(25)
