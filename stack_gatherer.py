@@ -9,13 +9,11 @@ import sys
 import shutil
 import json
 import csv
-import matplotlib.pyplot as plt
 import time
 import os
 import re
 import numpy as np
 import napari
-import random
 import multiprocessing
 import traceback
 import requests
@@ -557,7 +555,7 @@ class MyHandler(FileSystemEventHandler):
                 print("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
 
 
-def update_layer():
+def update_napari_viewer_layer():
     global LAYERS_INPUT
     if LAYERS_INPUT.qsize() > 0:
         data_input = LAYERS_INPUT.get()
@@ -565,7 +563,12 @@ def update_layer():
             if axes_names not in VIEWER.layers:
                 VIEWER.add_image(image, name=axes_names)
             else:
+                layer_image = VIEWER.layers[axes_names]
                 VIEWER.layers[axes_names].data = image
+                if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
+                    VIEWER.layers[axes_names].reset_contrast_limits()
+                if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
+                    VIEWER.layers[axes_names].reset_contrast_limits()
 
 
 def run_the_loop(kwargs):
@@ -596,7 +599,7 @@ def run_the_loop(kwargs):
                 token, chat_id = line.strip().split(" ")
             except Exception as err:
                 print(err)
-    avg_speed_data = manager.dict()
+    avg_speed_data = manager.list()
     # migration_detected = multiprocessing.Queue()
     migration_detected = manager.Queue()
     stop_process = Event()
@@ -632,12 +635,13 @@ def run_the_loop(kwargs):
 
     try:
         stop_file = os.path.join(input_dir, STOP_FILE_NAME)
-        while (not os.path.exists(stop_file)):
+        while not os.path.exists(stop_file):
             if migration_detected.qsize() > 0:
                 migration_event = migration_detected.get()
                 message = f"Detected on {migration_event}!"
                 if token and chat_id:
-                    url = (f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={message}&disable_web_page_preview=true")
+                    url = (f"https://api.telegram.org/bot{token}/"
+                           f"sendMessage?chat_id={chat_id}&text={message}&disable_web_page_preview=true")
                     response = requests.get(url)
                     if response.status_code != 200:
                         print(response.text)
@@ -654,7 +658,11 @@ def run_the_loop(kwargs):
         with open(os.path.join(output_dir, "quickPIV_data.csv"), 'w', newline='') as f_out:
             w = csv.writer(f_out)
             try:
-                w.writerows(avg_speed_data.items())
+                # sort results by specimen index
+                sorted_speed_data = sorted(avg_speed_data, key=lambda d: d['specimen'])
+                w = csv.DictWriter(f_out, sorted_speed_data[0].keys())
+                w.writeheader()
+                w.writerows(sorted_speed_data)
             except IOError:
                 print(f"Attempt to save csv data to {output_dir} failed")
     # Wait for the observer to complete
@@ -796,7 +804,7 @@ def make_napari_viewer(napari_viewer, windows_dict, specimen_quantity):
 
 def run_piv_process(shared_dict_queue: dict,
                     queue_out: multiprocessing.Queue,
-                    avg_speed_data: dict,
+                    avg_speed_data: list,
                     stop_process: Event,
                     piv_path: str,
                     migration_detected: multiprocessing.Queue,
@@ -851,7 +859,7 @@ def run_piv_process(shared_dict_queue: dict,
                 # current_time = now.strftime("%H:%M:%S")
                 t += 1
                 x.append(t)
-                avg_speed_data[t] = avg_speed
+                avg_speed_data.append({"time_point": t, "specimen": queue_number + 1, "avg_speed": avg_speed})
                 try:
                     y.append(avg_speed)
                 except Exception as error:
@@ -884,7 +892,7 @@ def run_piv_process(shared_dict_queue: dict,
                 raise ValueError("Projections should have the same size for QuickPIV input")
 
 
-def update_graph():
+def update_avg_speed_plot_windows():
     global PIV_OUTPUT
     if PIV_OUTPUT.qsize() > 0:
         index, x, y, x_marker, y_marker = PIV_OUTPUT.get()
@@ -944,10 +952,10 @@ def main():
     thread.start()
     VIEWER, PLT_WIDGETS_DICT = make_napari_viewer(VIEWER, PLT_WIDGETS_DICT, args.specimen_quantity)
     timer1 = QTimer()
-    timer1.timeout.connect(update_graph)
+    timer1.timeout.connect(update_avg_speed_plot_windows)
     timer1.start(25)
     timer2 = QTimer()
-    timer2.timeout.connect(update_layer)
+    timer2.timeout.connect(update_napari_viewer_layer)
     timer2.start(50)
     napari.run()
     thread.join()
