@@ -18,6 +18,8 @@ import multiprocessing
 import traceback
 import requests
 import threading
+import pandas as pd
+import matplotlib.pyplot as plt
 from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
 from PIL import Image
@@ -33,6 +35,7 @@ from multiprocessing import Manager, Event
 from MainWindow import Ui_MainWindow
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QMainWindow
+from scipy.signal import find_peaks
 
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
@@ -167,6 +170,10 @@ class ProjectionsDictWrapper:
     @property
     def signature(self) -> tuple:
         return self.stack_signature_obj.get_attr_excluding()
+
+    @property
+    def stack_signature(self) -> StackSignature:
+        return self.stack_signature_obj
 
 
 class ImageFile:
@@ -305,6 +312,15 @@ def read_image(image_path):
     return False
 
 
+def file_name_merged_illumination_based_on_signature(stack_signature):
+    return (f"timelapseID-{stack_signature.timelapse_id}_"
+            f"TP-{stack_signature.time_point}_"
+            f"SPC-{stack_signature.specimen}_"
+            f"ILL-MERGED_CAM-{stack_signature.camera}_"
+            f"CH-{stack_signature.channel}_"
+            f"Z_MAX_projection")
+
+
 def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
     """
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
@@ -350,6 +366,8 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
     if os.path.exists(output_file_path):
         return
     sample_image = read_image(file_list[0])
+    if isinstance(sample_image, bool):
+        return
     shape = (len(file_list), sample_image.shape[0], sample_image.shape[1])
     dtype = sample_image.dtype
     # create an empty OME-TIFF file
@@ -475,6 +493,37 @@ def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir
     del currenty_saving_stacks_locks[stack_signature.signature]
 
 
+def load_lapse_parameters_json(file_path: str,
+                               destination_folder: str):
+    try:
+        j_file = open(file_path)
+        lapse_parameters = json.load(j_file)
+        j_file.close()
+    except PermissionError:
+        print(f"{file_path} permission error, check if file is already opened")
+        return False
+    if lapse_parameters:
+        timestamp = os.path.basename(file_path).strip(".json").split("_")[1]
+        lapse_parameters["output_folder"] = destination_folder
+        setup_signature = []
+        for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
+            total_num_planes = spec_entry["number_of_planes"]
+            for channel_num, channel in enumerate(spec_entry["channels"]):
+                active_illum = channel["lightsheetsEnabled"]
+                active_illum = [idx for idx, value in enumerate(active_illum) if value]
+                for illum in active_illum:
+                    for camera_num, enabled in enumerate(channel["camerasEnabled"]):
+                        if enabled:
+                            setup_signature.append((total_num_planes,
+                                                    timestamp,
+                                                    specimen_number,
+                                                    illum,
+                                                    camera_num,
+                                                    channel_num))
+        return setup_signature, lapse_parameters
+    return False
+
+
 # Define the event handler class
 class MyHandler(FileSystemEventHandler):
     output_dir = ""
@@ -495,33 +544,9 @@ class MyHandler(FileSystemEventHandler):
         # load json parameters
         if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
             destination_folder = os.path.join(self.output_dir, os.path.basename(file_path).strip(".json"))
-            timestamp = os.path.basename(file_path).strip(".json").split("_")[1]
-            lapse_parameters = None
-            try:
-                j_file = open(file_path)
-                time.sleep(0.1)
-                lapse_parameters = json.load(j_file)
-                j_file.close()
-            except PermissionError:
-                print(f"{file_path} permission error, check if file is already opened")
+            lapse_parameters = load_lapse_parameters_json(file_path, destination_folder)
             if lapse_parameters:
-                lapse_parameters["output_folder"] = destination_folder
-                setup_signature = []
-                for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
-                    total_num_planes = spec_entry["number_of_planes"]
-                    for channel_num, channel in enumerate(spec_entry["channels"]):
-                        active_illum = channel["lightsheetsEnabled"]
-                        active_illum = [idx for idx, value in enumerate(active_illum) if value]
-                        for illum in active_illum:
-                            for camera_num, enabled in enumerate(channel["camerasEnabled"]):
-                                if enabled:
-                                    setup_signature.append((total_num_planes,
-                                                            timestamp,
-                                                            specimen_number,
-                                                            illum,
-                                                            camera_num,
-                                                            channel_num))
-                self.json_dict.update(dict.fromkeys(setup_signature, lapse_parameters))
+                self.json_dict.update(dict.fromkeys(*lapse_parameters))
             try:
                 if not os.path.exists(destination_folder):
                     os.mkdir(destination_folder)
@@ -581,8 +606,9 @@ def run_the_loop(kwargs):
     factor = kwargs.get("factor_anisotropy", None)
     TEMP_DIR = kwargs.get("temp_dir", None)
     PIVJLPATH = kwargs.get("pivjl", None)
-    bot_config_path = kwargs.get("bot_config", None)
+    bot_config_path = kwargs.get("bot_config", "")
     specimen_quantity = kwargs.get("specimen_quantity", None)
+    process_z_projections = kwargs.get("process_z_projections", None)
     token, chat_id = "", ""
 
     manager = Manager()
@@ -592,7 +618,7 @@ def run_the_loop(kwargs):
         shared_queues_of_z_projections = manager.dict()
         for i in range(0, specimen_quantity):
             shared_queues_of_z_projections[i] = manager.Queue()
-    if os.path.exists(bot_config_path):
+    if bot_config_path:
         with open(bot_config_path) as fin:
             try:
                 line = fin.readline()
@@ -600,7 +626,6 @@ def run_the_loop(kwargs):
             except Exception as err:
                 print(err)
     avg_speed_data = manager.list()
-    # migration_detected = multiprocessing.Queue()
     migration_detected = manager.Queue()
     stop_process = Event()
     piv_processes = []
@@ -614,27 +639,54 @@ def run_the_loop(kwargs):
                                               stop_process,
                                               PIVJLPATH,
                                               migration_detected,
-                                              index
+                                              index,
+                                              process_z_projections,
+                                              output_dir
                                               ),
                 name='piv_run',
             )
             piv_processes.append(piv_process)
             piv_process.start()
     # Create an observer and attach the event handler
-    observer = Observer()
-    observer.schedule(MyHandler(output_dir=output_dir,
-                                factor=factor,
-                                axes=axes,
-                                shared_dict=shared_queues_of_z_projections,
-                                json_dict=json_config),
-                      path=input_dir,
-                      recursive=False)
-    # Start the observer
-    observer.start()
-    print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
+    if process_z_projections:
+        print(f"Considering directory as Z projections source: {input_dir}, calculate"
+              f" average speed and save data and plots to {output_dir}")
+        z_projections = os.listdir(input_dir)
+        z_projections.sort()
+        for projection in z_projections:
+            file_path = os.path.join(input_dir, projection)
+            img_data = read_image(file_path)
+            img_metadata = ImageFile(file_path)
+            if not isinstance(img_data, bool) and not isinstance(img_metadata, bool):
+                stack_signature = img_metadata.get_stack_signature()
+                wrapped_z_projection = ProjectionsDictWrapper({"Z": img_data}, stack_signature)
+                # push to the queue for PIV calculations
+                if stack_signature.specimen in shared_queues_of_z_projections:
+                    while True:
+                        if shared_queues_of_z_projections[stack_signature.specimen].qsize() > 50:
+                            time.sleep(1)
+                        else:
+                            break
+                    shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
+        print(f"Finished with uploading projection files for quickPIV")
+
+    else:
+        observer = Observer()
+        observer.schedule(MyHandler(output_dir=output_dir,
+                                    factor=factor,
+                                    axes=axes,
+                                    shared_dict=shared_queues_of_z_projections,
+                                    json_dict=json_config),
+                          path=input_dir,
+                          recursive=False)
+        # Start the observer
+        observer.start()
+        print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
 
     try:
         stop_file = os.path.join(input_dir, STOP_FILE_NAME)
+        counter = 0
+        speed_list_len = []
         while not os.path.exists(stop_file):
             if migration_detected.qsize() > 0:
                 migration_event = migration_detected.get()
@@ -647,26 +699,68 @@ def run_the_loop(kwargs):
                         print(response.text)
                         print(url)
                 print(message)
-            time.sleep(1)  # Sleep to keep the script running
+            if process_z_projections:
+                # counter is used to check the list size approximately every minute
+                # if the avg_speed_data doesn't change - save the data and finish the pipeline
+                counter += 1
+                if counter % 30 == 0:
+                    speed_list_len.append(len(avg_speed_data))
+                    if len(speed_list_len) > 2:
+                        speed_list_len.pop(0)
+                        if speed_list_len[-1] == speed_list_len[-2]:
+                            print(f"No changes in quickPIV output queue, stop pipeline and save the data")
+                            f = open(os.path.join(input_dir, STOP_FILE_NAME), "w+")
+                            f.close()
+            # Sleep to keep the script running
+            time.sleep(1)
     except KeyboardInterrupt:
         # Gracefully stop the observer if the script is interrupted
-        observer.stop()
+        if not process_z_projections:
+            observer.stop()
     if PIVJLPATH:
         stop_process.set()
     # save PIV data to csv
     if avg_speed_data:
+        sorted_speed_data = sorted(avg_speed_data, key=lambda d: d['specimen'])
         with open(os.path.join(output_dir, "quickPIV_data.csv"), 'w', newline='') as f_out:
             w = csv.writer(f_out)
             try:
                 # sort results by specimen index
-                sorted_speed_data = sorted(avg_speed_data, key=lambda d: d['specimen'])
                 w = csv.DictWriter(f_out, sorted_speed_data[0].keys())
                 w.writeheader()
                 w.writerows(sorted_speed_data)
+                print(f"csv data saved to {output_dir}")
             except IOError:
                 print(f"Attempt to save csv data to {output_dir} failed")
+        if process_z_projections:
+            df = pd.DataFrame(sorted_speed_data)
+            specimen_indices = df["specimen"].unique()
+            for specimen_index in specimen_indices:
+                df_subsample = df[df["specimen"] == specimen_index]
+                x, y = df_subsample["time_point"], df_subsample["avg_speed"]
+                x = x.tolist()
+                y = y.tolist()
+                plt.rcParams['figure.figsize'] = [40, 20]
+                fig, ax = plt.subplots()
+                ax.plot(x, y)
+                y = np.asarray(y)
+                peaks, _ = find_peaks(y, prominence=1.5)
+                ax.plot(peaks, y[peaks], color='red', marker='o', markersize=12, linewidth=0)
+                dec_x = []
+                for i, num in enumerate(x, start=1):
+                    if i % 100 == 0:
+                        dec_x.append(num)
+                ax.xaxis.set_ticks(dec_x)
+                ax.set_xticklabels(dec_x, fontsize=12, rotation=0)
+                ax.set(xlabel='frame', ylabel='Avg. speed')
+                plt.title(f"Specimen {specimen_index}")
+                try:
+                    plt.savefig(os.path.join(output_dir, f"Specimen_{specimen_index}_avg_speed.png"))
+                except Exception as err:
+                    print(err)
     # Wait for the observer to complete
-    observer.join()
+    if not process_z_projections:
+        observer.join()
 
 
 def draw_napari_layer(projections_dict):
@@ -808,11 +902,12 @@ def run_piv_process(shared_dict_queue: dict,
                     stop_process: Event,
                     piv_path: str,
                     migration_detected: multiprocessing.Queue,
-                    queue_number: int
+                    queue_number: int,
+                    save_merged_illumination: bool,
+                    output_dir: str
                     ):
 
     from juliacall import Main as jl
-    from scipy.signal import find_peaks
     jl.include(piv_path)
     piv_projection_queue = Queue()
     projections_to_process = Queue()
@@ -839,6 +934,12 @@ def run_piv_process(shared_dict_queue: dict,
                                                                 )
                 merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
                                                              wrapped_z_p_2.signature)
+                if save_merged_illumination:
+                    try:
+                        file_name = file_name_merged_illumination_based_on_signature(wrapped_z_p_2.stack_signature)
+                        imwrite(os.path.join(output_dir, f"{file_name}.tif"), merged_wrapped_proj.projections["Z"])
+                    except Exception as err:
+                        migration_detected.put(f"Failed to save the merged Z-projection, {err}")
                 piv_projection_queue.put(merged_wrapped_proj)
                 projections_to_process.get()
             else:
@@ -921,18 +1022,22 @@ def main():
     parser.add_argument('--factor_anisotropy', type=int, required=True if '--axes' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
     # Specimen quantity
-    parser.add_argument('--specimen_quantity', type=int, required=True if '--pivjl' in sys.argv else False,
+    parser.add_argument('--specimen_quantity', type=int,
+                        required=True if '--pivjl' in sys.argv or '-process_z_projections' in sys.argv else False,
                         help="Value for number of specimens in the stage, defines number of plotting windows")
     # Move image files with incorrect name to the user provided directory
     parser.add_argument('--temp_dir', required=True,
                         help="Directory path to store input images with incorrect file name")
-    parser.add_argument('--pivjl', required=False, default=False,
+    parser.add_argument('--pivjl', required=True if '-process_z_projections' in sys.argv else False,
+                        default=False,
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
     parser.add_argument('--bot_config', required=False, default=False,
                         help="Path to text file with token and chat_id information (one line, space separator) for"
                              " supplying peaks detection on telegram messenger")
     parser.add_argument('-debug_run', required=False, default=False, action='store_true',
                         help="All content of --output specified folder will be DELETED!")
+    parser.add_argument('-process_z_projections', required=False, default=False, action='store_true',
+                        help="Process input files as Z-projections for average speed calculations with quickPIV!")
 
     # Parse the command-line arguments
     args = parser.parse_args()
