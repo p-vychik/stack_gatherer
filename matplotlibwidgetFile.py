@@ -1,4 +1,4 @@
-# Code was obtained from https://github.com/BiAPoL/blog/tree/blog_entry_UI/johannes_mueller/entry_user_interf2/scripts/example_2
+# Code was taken from https://github.com/BiAPoL/blog/tree/blog_entry_UI/johannes_mueller/entry_user_interf2/scripts/example_2
 # -*- coding: utf-8 -*-
 
 """

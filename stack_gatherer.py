@@ -23,8 +23,8 @@ import matplotlib.pyplot as plt
 from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
 from PIL import Image
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
+import asyncio
+from watchfiles import awatch
 from threading import Thread
 from queue import Queue
 from collections import OrderedDict
@@ -32,7 +32,7 @@ from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Manager, Event
-from MainWindow import Ui_MainWindow
+from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QMainWindow
 from scipy.signal import find_peaks
@@ -64,14 +64,14 @@ PIV_OUTPUT = multiprocessing.Queue()
 
 
 # Define the main window class
-class MainWindow(QMainWindow, Ui_MainWindow):
+class PlottingWindow(QMainWindow, Ui_MainWindow):
     window_index = 0
 
     def __init__(self):
         super().__init__()
         # Initialize GUI
         self.setupUi(self)
-        MainWindow.window_index += 1
+        PlottingWindow.window_index += 1
         self.setWindowTitle(f"QuickPIV average speed, specimen #{self.window_index}")
 
     def closeEvent(self, event):
@@ -524,60 +524,47 @@ def load_lapse_parameters_json(file_path: str,
     return False
 
 
-# Define the event handler class
-class MyHandler(FileSystemEventHandler):
-    output_dir = ""
-    factor = 1
-    axes = ""
-
-    def __init__(self, output_dir, factor, axes, shared_dict, json_dict):
-        self.output_dir = output_dir
-        self.factor = int(factor)
-        self.axes = axes
-        self.shared_dict = shared_dict
-        self.json_dict = json_dict
-
-    def on_created(self, event):
-        if event.is_directory:
+def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, factor=1, axes=""):
+    # changes, file_path = tuple(os.getenv('WATCHFILES_CHANGES'))
+    if os.path.isdir(file_path):
+        return
+    # load json parameters
+    if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
+        destination_folder = os.path.join(output_dir, os.path.basename(file_path).strip(".json"))
+        lapse_parameters = load_lapse_parameters_json(file_path, destination_folder)
+        if lapse_parameters:
+            json_dict.update(dict.fromkeys(*lapse_parameters))
+        try:
+            if not os.path.exists(destination_folder):
+                os.mkdir(destination_folder)
+                shutil.move(file_path, destination_folder)
+        except Exception as error:
+            print(error)
+    else:
+        if not file_path.endswith((".tif", ".bmp", ".tiff")):
             return
-        file_path = event.src_path
-        # load json parameters
-        if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
-            destination_folder = os.path.join(self.output_dir, os.path.basename(file_path).strip(".json"))
-            lapse_parameters = load_lapse_parameters_json(file_path, destination_folder)
-            if lapse_parameters:
-                self.json_dict.update(dict.fromkeys(*lapse_parameters))
+        # Call the function when a new file is created
+        try:
+            file = ImageFile(file_path)
+        except NotImagePlaneFile:
+            # image file is incorrect, move it to the temp_dir
             try:
-                if not os.path.exists(destination_folder):
-                    os.mkdir(destination_folder)
-                    shutil.move(file_path, destination_folder)
-            except Exception as error:
-                print(error)
-        else:
-            if not file_path.endswith((".tif", ".bmp", ".tiff")):
-                return
-            # Call the function when a new file is created
-            try:
-                file = ImageFile(file_path)
-            except NotImagePlaneFile:
-                # image file is incorrect, move it to the temp_dir
-                try:
-                    shutil.move(file_path, TEMP_DIR)
-                except OSError:
-                    pass
-                return
-            stack_signature = add_file_to_active_stacks(file)
-            # create separate folder for the output based on metadata filename
-            try:
-                output_dir = self.json_dict[stack_signature.signature_no_time]["output_folder"]
-                if os.path.exists(output_dir):
-                    check_stack_and_collect_if_ready(stack_signature,
-                                                     output_dir,
-                                                     self.shared_dict,
-                                                     self.axes,
-                                                     self.factor)
-            except KeyError:
-                print("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
+                shutil.move(file_path, TEMP_DIR)
+            except OSError:
+                pass
+            return
+        stack_signature = add_file_to_active_stacks(file)
+        # create separate folder for the output based on metadata filename
+        try:
+            output_dir = json_dict[stack_signature.signature_no_time]["output_folder"]
+            if os.path.exists(output_dir):
+                check_stack_and_collect_if_ready(stack_signature,
+                                                 output_dir,
+                                                 shared_dict,
+                                                 axes,
+                                                 factor)
+        except KeyError:
+            print("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
 
 
 def update_napari_viewer_layer():
@@ -594,6 +581,34 @@ def update_napari_viewer_layer():
                     VIEWER.layers[axes_names].reset_contrast_limits()
                 if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
                     VIEWER.layers[axes_names].reset_contrast_limits()
+
+
+async def read_input_files(input_folder,
+                           output_dir,
+                           shared_queues_of_z_projections,
+                           json_config,
+                           factor,
+                           axes):
+
+    async for changes in awatch(input_folder):
+        paths = []
+        for change in changes:
+            event, file_path = change
+            if event.value == 1:
+                paths.append(file_path)
+        if paths:
+            paths.sort()
+            for path in paths:
+                load_file_from_input_folder(path,
+                                            output_dir,
+                                            shared_queues_of_z_projections,
+                                            json_config,
+                                            factor,
+                                            axes)
+
+
+def watchfiles_thread(*args):
+    asyncio.run(read_input_files(*args))
 
 
 def run_the_loop(kwargs):
@@ -647,7 +662,7 @@ def run_the_loop(kwargs):
             )
             piv_processes.append(piv_process)
             piv_process.start()
-    # Create an observer and attach the event handler
+    # mode to process only max projections
     if process_z_projections:
         print(f"Considering directory as Z projections source: {input_dir}, calculate"
               f" average speed and save data and plots to {output_dir}")
@@ -671,18 +686,16 @@ def run_the_loop(kwargs):
         print(f"Finished with uploading projection files for quickPIV")
 
     else:
-        observer = Observer()
-        observer.schedule(MyHandler(output_dir=output_dir,
-                                    factor=factor,
-                                    axes=axes,
-                                    shared_dict=shared_queues_of_z_projections,
-                                    json_dict=json_config),
-                          path=input_dir,
-                          recursive=False)
-        # Start the observer
-        observer.start()
+        # # Start the observer
         print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
-
+        thread = Thread(target=watchfiles_thread, args=(input_dir,
+                                                         output_dir,
+                                                         shared_queues_of_z_projections,
+                                                         json_config,
+                                                         factor,
+                                                         axes )
+                        )
+        thread.start()
     try:
         stop_file = os.path.join(input_dir, STOP_FILE_NAME)
         counter = 0
@@ -716,7 +729,7 @@ def run_the_loop(kwargs):
     except KeyboardInterrupt:
         # Gracefully stop the observer if the script is interrupted
         if not process_z_projections:
-            observer.stop()
+            thread.stop()
     if PIVJLPATH:
         stop_process.set()
     # save PIV data to csv
@@ -760,7 +773,7 @@ def run_the_loop(kwargs):
                     print(err)
     # Wait for the observer to complete
     if not process_z_projections:
-        observer.join()
+        thread.join()
 
 
 def draw_napari_layer(projections_dict):
@@ -890,7 +903,7 @@ def make_napari_viewer(napari_viewer, windows_dict, specimen_quantity=None):
     napari_viewer.window.add_dock_widget(bx)
     if PIVJLPATH and specimen_quantity:
         for i in range(0, specimen_quantity):
-            windows_dict[i] = MainWindow()
+            windows_dict[i] = PlottingWindow()
             windows_dict[i].show()
     # napari_viewer.window.add_dock_widget(matplotlibwidget, area='bottom', name='')
     return napari_viewer, windows_dict
