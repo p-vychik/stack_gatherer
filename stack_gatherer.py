@@ -882,7 +882,7 @@ def bx_trigger():
     MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
 
 
-def make_napari_viewer(napari_viewer, windows_dict, specimen_quantity):
+def make_napari_viewer(napari_viewer, windows_dict, specimen_quantity=None):
     napari_viewer = napari.Viewer()
     bx = QCheckBox('Merge illumination channels')
     bx.setChecked(MERGE_LIGHT_MODES)
@@ -1055,7 +1055,10 @@ def main():
     global VIEWER, PLT_WIDGETS_DICT
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
-    VIEWER, PLT_WIDGETS_DICT = make_napari_viewer(VIEWER, PLT_WIDGETS_DICT, args.specimen_quantity)
+    if hasattr(args, "specimen_quantity"):
+        VIEWER, PLT_WIDGETS_DICT = make_napari_viewer(VIEWER, PLT_WIDGETS_DICT, args.specimen_quantity)
+    else:
+        VIEWER, PLT_WIDGETS_DICT = make_napari_viewer(VIEWER, PLT_WIDGETS_DICT)
     timer1 = QTimer()
     timer1.timeout.connect(update_avg_speed_plot_windows)
     timer1.start(25)
