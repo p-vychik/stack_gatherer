@@ -33,8 +33,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Manager, Event
 from PlottingWindow import Ui_MainWindow
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QApplication, QMainWindow
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QMainWindow
 from scipy.signal import find_peaks
 
 
@@ -54,7 +54,9 @@ VIEWER = None
 PLT_WIDGETS_DICT = {}
 TEMP_DIR = ""
 PIVJLPATH = ""
-
+SPECIMENS_QUANTITY_LOADED = False
+SPECIMENS_QUANTITY = 0
+PLOTTING_WINDOW_CREATED = False
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
@@ -67,11 +69,12 @@ PIV_OUTPUT = multiprocessing.Queue()
 class PlottingWindow(QMainWindow, Ui_MainWindow):
     window_index = 0
 
-    def __init__(self):
+    def __init__(self, window_index):
         super().__init__()
         # Initialize GUI
         self.setupUi(self)
-        PlottingWindow.window_index += 1
+        self.window_index = window_index + 1
+        # PlottingWindow.window_index += 1
         self.setWindowTitle(f"QuickPIV average speed, specimen #{self.window_index}")
 
     def closeEvent(self, event):
@@ -434,6 +437,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                 shared_dict[stack_signature.specimen].put(wrapped_z_projection)
             else:
                 print(f"Specimen signature not found in shared queue, signature: {stack_signature}")
+                # print(shared_dict)
         for axis in projections.keys():
             try:
                 imwrite(projections_files_path[axis], projections[axis])
@@ -442,7 +446,6 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
 
         # we want to store projections derived from planes with different illumination modes to
         # have an option to merge them if the user checked the QCheckBox() in napari viewer GUI interface
-
         wrapped_projections = ProjectionsDictWrapper(projections, stack_signature)
         if wrapped_projections.signature not in PROJECTIONS_QUEUE:
             PROJECTIONS_QUEUE[wrapped_projections.identifier] = [wrapped_projections]
@@ -488,7 +491,9 @@ def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir
                                                      output_dir=output_dir
                                                      )
     global LAYERS_INPUT
-    LAYERS_INPUT.put(get_projections_dict_from_queue())
+    images_dict = get_projections_dict_from_queue()
+    if images_dict:
+        LAYERS_INPUT.put(images_dict)
     del active_stacks[stack_signature.signature]
     del currenty_saving_stacks_locks[stack_signature.signature]
 
@@ -524,8 +529,11 @@ def load_lapse_parameters_json(file_path: str,
     return False
 
 
-def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, factor=1, axes=""):
-    # changes, file_path = tuple(os.getenv('WATCHFILES_CHANGES'))
+def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, manager, factor=1, axes=""):
+    global SPECIMENS_QUANTITY
+    global SPECIMENS_QUANTITY_LOADED
+    global PLOTTING_WINDOW_CREATED
+
     if os.path.isdir(file_path):
         return
     # load json parameters
@@ -534,6 +542,17 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, f
         lapse_parameters = load_lapse_parameters_json(file_path, destination_folder)
         if lapse_parameters:
             json_dict.update(dict.fromkeys(*lapse_parameters))
+            # get specimens quantity
+            try:
+                SPECIMENS_QUANTITY = len(lapse_parameters[-1]['specimens'])
+                SPECIMENS_QUANTITY_LOADED = True
+            except Exception as err:
+                print(err)
+            if SPECIMENS_QUANTITY:
+                shared_dict.clear()
+                for i in range(0, SPECIMENS_QUANTITY):
+                    shared_dict[i] = manager.Queue()
+            PLOTTING_WINDOW_CREATED = False
         try:
             if not os.path.exists(destination_folder):
                 os.mkdir(destination_folder)
@@ -587,6 +606,7 @@ async def read_input_files(input_folder,
                            output_dir,
                            shared_queues_of_z_projections,
                            json_config,
+                           manager,
                            factor,
                            axes):
 
@@ -603,6 +623,7 @@ async def read_input_files(input_folder,
                                             output_dir,
                                             shared_queues_of_z_projections,
                                             json_config,
+                                            manager,
                                             factor,
                                             axes)
 
@@ -614,6 +635,8 @@ def watchfiles_thread(*args):
 def run_the_loop(kwargs):
     global PIVJLPATH
     global TEMP_DIR
+    global SPECIMENS_QUANTITY_LOADED
+    global SPECIMENS_QUANTITY
 
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
@@ -622,158 +645,182 @@ def run_the_loop(kwargs):
     TEMP_DIR = kwargs.get("temp_dir", None)
     PIVJLPATH = kwargs.get("pivjl", None)
     bot_config_path = kwargs.get("bot_config", "")
-    specimen_quantity = kwargs.get("specimen_quantity", None)
-    process_z_projections = kwargs.get("process_z_projections", None)
+    specimen_quantity = kwargs.get("specimen_quantity", 0)
+    process_z_projections = kwargs.get("process_z_projections", False)
     token, chat_id = "", ""
 
-    manager = Manager()
-    shared_queues_of_z_projections = manager.dict()
-    json_config = manager.dict()
-    if specimen_quantity:
-        shared_queues_of_z_projections = manager.dict()
-        for i in range(0, specimen_quantity):
-            shared_queues_of_z_projections[i] = manager.Queue()
-    if bot_config_path:
-        with open(bot_config_path) as fin:
-            try:
-                line = fin.readline()
-                token, chat_id = line.strip().split(" ")
-            except Exception as err:
-                print(err)
-    avg_speed_data = manager.list()
-    migration_detected = manager.Queue()
-    stop_process = Event()
     piv_processes = []
-    # start quickPIV process
-    if PIVJLPATH and specimen_quantity:
-        for index in range(0, specimen_quantity):
-            piv_process = PivProcess(
-                target=run_piv_process, args=(shared_queues_of_z_projections,
-                                              PIV_OUTPUT,
-                                              avg_speed_data,
-                                              stop_process,
-                                              PIVJLPATH,
-                                              migration_detected,
-                                              index,
-                                              process_z_projections,
-                                              output_dir
-                                              ),
-                name='piv_run',
-            )
-            piv_processes.append(piv_process)
-            piv_process.start()
-    # mode to process only max projections
-    if process_z_projections:
-        print(f"Considering directory as Z projections source: {input_dir}, calculate"
-              f" average speed and save data and plots to {output_dir}")
-        z_projections = os.listdir(input_dir)
-        z_projections.sort()
-        for projection in z_projections:
-            file_path = os.path.join(input_dir, projection)
-            img_data = read_image(file_path)
-            img_metadata = ImageFile(file_path)
-            if not isinstance(img_data, bool) and not isinstance(img_metadata, bool):
-                stack_signature = img_metadata.get_stack_signature()
-                wrapped_z_projection = ProjectionsDictWrapper({"Z": img_data}, stack_signature)
-                # push to the queue for PIV calculations
-                if stack_signature.specimen in shared_queues_of_z_projections:
-                    while True:
-                        if shared_queues_of_z_projections[stack_signature.specimen].qsize() > 50:
-                            time.sleep(1)
-                        else:
-                            break
-                    shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
-        print(f"Finished with uploading projection files for quickPIV")
+    manager = Manager()
+    json_config = manager.dict()
+    shared_queues_of_z_projections = manager.dict()
 
-    else:
-        # # Start the observer
-        print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
-        thread = Thread(target=watchfiles_thread, args=(input_dir,
-                                                         output_dir,
-                                                         shared_queues_of_z_projections,
-                                                         json_config,
-                                                         factor,
-                                                         axes )
-                        )
-        thread.start()
-    try:
-        stop_file = os.path.join(input_dir, STOP_FILE_NAME)
-        counter = 0
-        speed_list_len = []
-        while not os.path.exists(stop_file):
-            if migration_detected.qsize() > 0:
-                migration_event = migration_detected.get()
-                message = f"Detected on {migration_event}!"
-                if token and chat_id:
-                    url = (f"https://api.telegram.org/bot{token}/"
-                           f"sendMessage?chat_id={chat_id}&text={message}&disable_web_page_preview=true")
-                    response = requests.get(url)
-                    if response.status_code != 200:
-                        print(response.text)
-                        print(url)
-                print(message)
+    # Start the input directory observer
+    print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
+    thread = Thread(target=watchfiles_thread, args=(input_dir,
+                                                    output_dir,
+                                                    shared_queues_of_z_projections,
+                                                    json_config,
+                                                    manager,
+                                                    factor,
+                                                    axes)
+                    )
+    thread.start()
+
+    while True:
+        migration_detected = manager.Queue()
+        avg_speed_data = manager.list()
+        stop_process = Event()
+
+        if PIVJLPATH:
+            while not SPECIMENS_QUANTITY_LOADED and not process_z_projections:
+                time.sleep(1)
+
+            if specimen_quantity:
+                # update global variable to create plotting windows
+                SPECIMENS_QUANTITY = specimen_quantity
+                for i in range(0, specimen_quantity):
+                    shared_queues_of_z_projections[i] = manager.Queue()
+
+            if SPECIMENS_QUANTITY:
+                SPECIMENS_QUANTITY_LOADED = False
+
+            if bot_config_path:
+                with open(bot_config_path) as fin:
+                    try:
+                        line = fin.readline()
+                        token, chat_id = line.strip().split(" ")
+                    except Exception as err:
+                        print(err)
+
+            for i, _ in shared_queues_of_z_projections.items():
+                piv_process = PivProcess(
+                    target=run_piv_process, args=(shared_queues_of_z_projections,
+                                                  PIV_OUTPUT,
+                                                  avg_speed_data,
+                                                  stop_process,
+                                                  PIVJLPATH,
+                                                  migration_detected,
+                                                  i,
+                                                  process_z_projections,
+                                                  output_dir
+                                                  ),
+                    name='piv_run',
+                )
+                piv_processes.append(piv_process)
+                piv_process.start()
+
+            # mode to process only max projections
             if process_z_projections:
-                # counter is used to check the list size approximately every minute
-                # if the avg_speed_data doesn't change - save the data and finish the pipeline
-                counter += 1
-                if counter % 30 == 0:
-                    speed_list_len.append(len(avg_speed_data))
-                    if len(speed_list_len) > 2:
-                        speed_list_len.pop(0)
-                        if speed_list_len[-1] == speed_list_len[-2]:
-                            print(f"No changes in quickPIV output queue, stop pipeline and save the data")
-                            f = open(os.path.join(input_dir, STOP_FILE_NAME), "w+")
-                            f.close()
-            # Sleep to keep the script running
-            time.sleep(1)
-    except KeyboardInterrupt:
-        # Gracefully stop the observer if the script is interrupted
-        if not process_z_projections:
-            thread.stop()
-    if PIVJLPATH:
-        stop_process.set()
-    # save PIV data to csv
-    if avg_speed_data:
-        sorted_speed_data = sorted(avg_speed_data, key=lambda d: d['specimen'])
-        with open(os.path.join(output_dir, "quickPIV_data.csv"), 'w', newline='') as f_out:
-            w = csv.writer(f_out)
-            try:
-                # sort results by specimen index
-                w = csv.DictWriter(f_out, sorted_speed_data[0].keys())
-                w.writeheader()
-                w.writerows(sorted_speed_data)
-                print(f"csv data saved to {output_dir}")
-            except IOError:
-                print(f"Attempt to save csv data to {output_dir} failed")
-        if process_z_projections:
-            df = pd.DataFrame(sorted_speed_data)
-            specimen_indices = df["specimen"].unique()
-            for specimen_index in specimen_indices:
-                df_subsample = df[df["specimen"] == specimen_index]
-                x, y = df_subsample["time_point"], df_subsample["avg_speed"]
-                x = x.tolist()
-                y = y.tolist()
-                plt.rcParams['figure.figsize'] = [40, 20]
-                fig, ax = plt.subplots()
-                ax.plot(x, y)
-                y = np.asarray(y)
-                peaks, _ = find_peaks(y, prominence=1.5)
-                ax.plot(peaks, y[peaks], color='red', marker='o', markersize=12, linewidth=0)
-                dec_x = []
-                for i, num in enumerate(x, start=1):
-                    if i % 100 == 0:
-                        dec_x.append(num)
-                ax.xaxis.set_ticks(dec_x)
-                ax.set_xticklabels(dec_x, fontsize=12, rotation=0)
-                ax.set(xlabel='frame', ylabel='Avg. speed')
-                plt.title(f"Specimen {specimen_index}")
+                print(f"Considering directory as Z projections source: {input_dir}, calculate"
+                      f" average speed and save data and plots to {output_dir}")
+                z_projections = os.listdir(input_dir)
+                z_projections.sort()
+                for projection in z_projections:
+                    file_path = os.path.join(input_dir, projection)
+                    img_data = read_image(file_path)
+                    img_metadata = ImageFile(file_path)
+                    if not isinstance(img_data, bool) and not isinstance(img_metadata, bool):
+                        stack_signature = img_metadata.get_stack_signature()
+                        wrapped_z_projection = ProjectionsDictWrapper({"Z": img_data}, stack_signature)
+                        # push projection to the queue for PIV calculations
+                        if stack_signature.specimen in shared_queues_of_z_projections:
+                            while True:
+                                if shared_queues_of_z_projections[stack_signature.specimen].qsize() > 50:
+                                    time.sleep(1)
+                                else:
+                                    break
+                            shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
+                print(f"Finished with uploading projection files for quickPIV")
+
+        try:
+            stop_file = os.path.join(input_dir, STOP_FILE_NAME)
+            counter = 0
+            speed_list_len = []
+            while not os.path.exists(stop_file) and not SPECIMENS_QUANTITY_LOADED:
+                if migration_detected.qsize() > 0:
+                    migration_event = migration_detected.get()
+                    message = f"Detected on {migration_event}!"
+                    if token and chat_id:
+                        url = (f"https://api.telegram.org/bot{token}/"
+                               f"sendMessage?chat_id={chat_id}&text={message}&disable_web_page_preview=true")
+                        response = requests.get(url)
+                        if response.status_code != 200:
+                            print(response.text)
+                            print(url)
+                    print(message)
+                if process_z_projections:
+                    # counter is used to check the list size approximately every minute
+                    # if the avg_speed_data doesn't change - save the data and finish the pipeline
+                    counter += 1
+                    if counter % 30 == 0:
+                        speed_list_len.append(len(avg_speed_data))
+                        if len(speed_list_len) > 2:
+                            speed_list_len.pop(0)
+                            if speed_list_len[-1] == speed_list_len[-2]:
+                                print(f"No changes in quickPIV output queue, stop pipeline and save the data")
+                                break
+                # Sleep to keep the script running
+                time.sleep(1)
+            if PIVJLPATH:
+                stop_process.set()
+        except KeyboardInterrupt:
+            # Gracefully stop the observer if the script is interrupted
+            break
+
+        # terminate running quickPIV processes
+        if piv_processes:
+            for process in piv_processes:
+                process.terminate()
+                time.sleep(0.1)
+                process.join()
+            time.sleep(0.5)
+            piv_processes = []
+
+        # save PIV data to csv
+        if avg_speed_data:
+            sorted_speed_data = sorted(avg_speed_data, key=lambda d: d['specimen'])
+            current_time = datetime.now()
+            with open(os.path.join(output_dir, f"quickPIV_data_{current_time.strftime('%H_%M_%S')}.csv"),
+                      'w', newline='') as f_out:
                 try:
-                    plt.savefig(os.path.join(output_dir, f"Specimen_{specimen_index}_avg_speed.png"))
-                except Exception as err:
-                    print(err)
-    # Wait for the observer to complete
-    if not process_z_projections:
-        thread.join()
+                    # sort results by specimen index
+                    w = csv.DictWriter(f_out, sorted_speed_data[0].keys())
+                    w.writeheader()
+                    w.writerows(sorted_speed_data)
+                    print(f"csv data saved to {output_dir}")
+                except IOError:
+                    print(f"Attempt to save csv data to {output_dir} failed")
+            if process_z_projections:
+                df = pd.DataFrame(sorted_speed_data)
+                specimen_indices = df["specimen"].unique()
+                for specimen_index in specimen_indices:
+                    df_subsample = df[df["specimen"] == specimen_index]
+                    x, y = df_subsample["time_point"], df_subsample["avg_speed"]
+                    x = x.tolist()
+                    y = y.tolist()
+                    plt.rcParams['figure.figsize'] = [40, 20]
+                    fig, ax = plt.subplots()
+                    ax.plot(x, y)
+                    y = np.asarray(y)
+                    peaks, _ = find_peaks(y, prominence=1.5)
+                    ax.plot(peaks, y[peaks], color='red', marker='o', markersize=12, linewidth=0)
+                    dec_x = []
+                    for i, num in enumerate(x, start=1):
+                        if i % 100 == 0:
+                            dec_x.append(num)
+                    ax.xaxis.set_ticks(dec_x)
+                    ax.set_xticklabels(dec_x, fontsize=12, rotation=0)
+                    ax.set(xlabel='frame', ylabel='Avg. speed')
+                    plt.title(f"Specimen {specimen_index}")
+                    try:
+                        plt.savefig(os.path.join(output_dir,
+                                                 f"Specimen_{specimen_index}_avg_speed_"
+                                                 f"{current_time.strftime('%H_%M_%S')}.png"))
+                    except Exception as err:
+                        print(err)
+        if os.path.exists(stop_file) or process_z_projections:
+            break
+    thread.join()
 
 
 def draw_napari_layer(projections_dict):
@@ -895,18 +942,13 @@ def bx_trigger():
     MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
 
 
-def make_napari_viewer(napari_viewer, windows_dict, specimen_quantity=None):
+def make_napari_viewer():
     napari_viewer = napari.Viewer()
     bx = QCheckBox('Merge illumination channels')
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     napari_viewer.window.add_dock_widget(bx)
-    if PIVJLPATH and specimen_quantity:
-        for i in range(0, specimen_quantity):
-            windows_dict[i] = PlottingWindow()
-            windows_dict[i].show()
-    # napari_viewer.window.add_dock_widget(matplotlibwidget, area='bottom', name='')
-    return napari_viewer, windows_dict
+    return napari_viewer
 
 
 def run_piv_process(shared_dict_queue: dict,
@@ -1016,6 +1058,20 @@ def update_avg_speed_plot_windows():
             print(f"window with index {index} doesn't exist")
 
 
+def make_plotting_windows_visible():
+    global PLOTTING_WINDOW_CREATED
+    global PLT_WIDGETS_DICT
+
+    if PIVJLPATH and not PLOTTING_WINDOW_CREATED:
+        if len(PLT_WIDGETS_DICT) > 0:
+            # delete window from previous lapse
+            PLT_WIDGETS_DICT = {}
+        for i in range(0, SPECIMENS_QUANTITY):
+            PLT_WIDGETS_DICT[i] = PlottingWindow(i)
+            PLT_WIDGETS_DICT[i].show()
+        PLOTTING_WINDOW_CREATED = True
+
+
 def main():
     # Create the argument parser
     parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif or .bmp "
@@ -1036,8 +1092,9 @@ def main():
                         help="Value is used for correcting projection's anisotropic distortions")
     # Specimen quantity
     parser.add_argument('--specimen_quantity', type=int,
-                        required=True if '--pivjl' in sys.argv or '-process_z_projections' in sys.argv else False,
-                        help="Value for number of specimens in the stage, defines number of plotting windows")
+                        required=True if '-process_z_projections' in sys.argv else False,
+                        help="Value for number of specimens in the stage, defines number of plotting windows "
+                             "if json config is not available")
     # Move image files with incorrect name to the user provided directory
     parser.add_argument('--temp_dir', required=True,
                         help="Directory path to store input images with incorrect file name")
@@ -1049,7 +1106,8 @@ def main():
                              " supplying peaks detection on telegram messenger")
     parser.add_argument('-debug_run', required=False, default=False, action='store_true',
                         help="All content of --output specified folder will be DELETED!")
-    parser.add_argument('-process_z_projections', required=False, default=False, action='store_true',
+    parser.add_argument('-process_z_projections',
+                        required=True if '--specimen_quantity' in sys.argv else False, action='store_true',
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
 
     # Parse the command-line arguments
@@ -1068,16 +1126,16 @@ def main():
     global VIEWER, PLT_WIDGETS_DICT
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
-    if hasattr(args, "specimen_quantity"):
-        VIEWER, PLT_WIDGETS_DICT = make_napari_viewer(VIEWER, PLT_WIDGETS_DICT, args.specimen_quantity)
-    else:
-        VIEWER, PLT_WIDGETS_DICT = make_napari_viewer(VIEWER, PLT_WIDGETS_DICT)
+    VIEWER = make_napari_viewer()
     timer1 = QTimer()
     timer1.timeout.connect(update_avg_speed_plot_windows)
     timer1.start(25)
     timer2 = QTimer()
     timer2.timeout.connect(update_napari_viewer_layer)
     timer2.start(50)
+    timer3 = QTimer()
+    timer3.timeout.connect(make_plotting_windows_visible)
+    timer3.start(1000)
     napari.run()
     thread.join()
 
