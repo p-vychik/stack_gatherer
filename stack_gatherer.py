@@ -1078,17 +1078,17 @@ def main():
                                                  "files as stacks to output directory.",
                                      argument_default=argparse.SUPPRESS)
     # Define the input_folder argument
-    parser.add_argument('--input', required=True, help="Input folder path to watch.")
+    parser.add_argument('-i', '--input', required=True, help="Input folder path to watch.")
 
     # Define the output_folder argument
-    parser.add_argument('--output', required=True, help="Output folder path to save stacks.")
+    parser.add_argument('-o', '--output', required=True, help="Output folder path to save stacks.")
 
     # Define axes to make projections
-    parser.add_argument('--axes', required=False, help="Comma separated axes to project "
+    parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project "
                                                        "on the plane, i.e. X,Y,Z or X, or X")
 
     # Anisotropy factor correction
-    parser.add_argument('--factor_anisotropy', type=int, required=True if '--axes' in sys.argv else False,
+    parser.add_argument('-f', '--factor_anisotropy', type=int, required=True if '--axes' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
     # Specimen quantity
     parser.add_argument('--specimen_quantity', type=int,
@@ -1096,7 +1096,8 @@ def main():
                         help="Value for number of specimens in the stage, defines number of plotting windows "
                              "if json config is not available")
     # Move image files with incorrect name to the user provided directory
-    parser.add_argument('--temp_dir', required=True,
+    parser.add_argument('--temp_dir', required=False,
+                        default=None,
                         help="Directory path to store input images with incorrect file name")
     parser.add_argument('--pivjl', required=True if '-process_z_projections' in sys.argv else False,
                         default=False,
@@ -1112,6 +1113,8 @@ def main():
 
     # Parse the command-line arguments
     args = parser.parse_args()
+    if args.temp_dir is None:
+        args.temp_dir = args.output
     if args.debug_run:
         # for testing purposes only - empty the output folder before loading files
         for filename in os.listdir(args.output):
