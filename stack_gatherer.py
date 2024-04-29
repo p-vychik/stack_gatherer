@@ -32,11 +32,14 @@ from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Manager, Event
+
+import zmq
 from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QMainWindow
 from scipy.signal import find_peaks
 
+# import debugpy
 
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 ACQUISITION_META_FILE_PATTERN = "AcquisitionMetadata_"
@@ -60,6 +63,10 @@ PLOTTING_WINDOW_CREATED = False
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
+HEARTBEAT_INTERVAL_SEC = 5
+command_queue_to_microscope = Queue()
+new_microscope_command_event = threading.Event()
+
 
 LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
@@ -654,6 +661,8 @@ def run_the_loop(kwargs):
     json_config = manager.dict()
     shared_queues_of_z_projections = manager.dict()
 
+    
+
     # Start the input directory observer
     print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
     thread = Thread(target=watchfiles_thread, args=(input_dir,
@@ -1072,6 +1081,55 @@ def make_plotting_windows_visible():
         PLOTTING_WINDOW_CREATED = True
 
 
+def parse_message_from_microscope(message):
+    time.sleep(0.01)
+    try: 
+        if message.get("type") == "exit":
+            print("Recieved terminate command from microscope.", file=sys.stderr)
+            os._exit(1) # TODO: implement gracefull exit
+        elif message.get("type") == "heartbeat":
+            print("Received heartbeat from the microscope.", file=sys.stderr)
+    except:
+        pass
+
+def heartbeat_and_command_handler(port):
+    """Background thread function to send heartbeats and handle commands to the microscope."""
+    context = zmq.Context()
+    socket = context.socket(zmq.PAIR)
+    socket.connect(f"tcp://localhost:{port}")
+
+    # Set up a poller to allow for non-blocking waits on the socket
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)  # POLLIN for incoming messages
+
+    last_heartbeat_time = time.time() - HEARTBEAT_INTERVAL_SEC
+
+    while True:
+        # Check for the next heartbeat or frequent checks for the command queue
+        next_heartbeat_time = last_heartbeat_time + HEARTBEAT_INTERVAL_SEC
+        time_until_heartbeat = max(0, next_heartbeat_time - time.time())
+        # Timeout in milliseconds, max 50ms
+        timeout = min(50, time_until_heartbeat * 1000)
+
+        # Poll the socket to check for new messages
+        events = dict(poller.poll(timeout))
+        if socket in events:
+            message = socket.recv_json()
+            print("Received message:", message, file=sys.stderr)
+            parse_message_from_microscope(message)
+
+        # Send a heartbeat if it's time
+        current_time = time.time()
+        if current_time >= next_heartbeat_time:
+            print("Sending heartbeat to the microscope.", file=sys.stderr)
+            socket.send_json({"type": "heartbeat", "message": "alive"})
+            last_heartbeat_time = current_time  # Update last heartbeat time
+
+        while not command_queue_to_microscope.empty():
+            command = command_queue_to_microscope.get_nowait()
+            socket.send_json({"type": "command", "message": command})
+
+
 def main():
     # Create the argument parser
     parser = argparse.ArgumentParser(description="Watch a directory for new file additions and collect .tif or .bmp "
@@ -1086,6 +1144,8 @@ def main():
     # Define axes to make projections
     parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project "
                                                        "on the plane, i.e. X,Y,Z or X, or X")
+    # Define port for communication with MicroscopeController software
+    parser.add_argument('-p', '--port', required=False, help="Integer value of the port")
 
     # Anisotropy factor correction
     parser.add_argument('-f', '--factor_anisotropy', type=int, required=True if '--axes' in sys.argv else False,
@@ -1127,6 +1187,16 @@ def main():
             except Exception as e:
                 print(e)
     global VIEWER, PLT_WIDGETS_DICT
+
+
+    # Allow other computers to attach to debugpy at this IP address and port.
+    # debugpy.listen(('0.0.0.0', 5680))
+    # print("Waiting for debugger attach")
+    # debugpy.wait_for_client()  # Blocks execution until client is attached
+
+    thread = threading.Thread(
+        target=heartbeat_and_command_handler, args=(args.port,))
+    thread.start()
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
     VIEWER = make_napari_viewer()
