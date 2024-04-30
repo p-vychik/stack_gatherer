@@ -72,6 +72,8 @@ LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
 
 
+def debugprint(*args):
+    print(*args, file=sys.stderr)
 # Define the main window class
 class PlottingWindow(QMainWindow, Ui_MainWindow):
     window_index = 0
@@ -120,7 +122,7 @@ class PivProcess(multiprocessing.Process):
     def exception(self):
         if self._pconn.poll():
             self._exception = self._pconn.recv()
-            print(self._exception[0])
+            debugprint(self._exception[0])
         return self._exception
 
 
@@ -304,7 +306,7 @@ def read_image(image_path):
             image = imread(image_path)
             return image
         except Exception as error:
-            print(error)
+            debugprint(error)
     if image_path.endswith(".bmp"):
         try:
             image = Image.open(image_path)
@@ -318,7 +320,7 @@ def read_image(image_path):
                 return np.asarray(image, dtype="uint16")
             return np.array(image)
         except Exception as error:
-            print(error)
+            debugprint(error)
     return False
 
 
@@ -384,7 +386,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
     imwrite(output_file_path, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
     # memory map numpy array to data in OME-TIFF file
     zyx_stack = memmap(output_file_path)
-    print(f"Writing stack to {output_file_path}")
+    debugprint(f"Writing stack to {output_file_path}")
     # prepare input about required projections in the dictionary,
     # the values of the appropriate keys would be the projection matrices
     projections = {}
@@ -400,7 +402,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                     os.makedirs(projection_folder_path)
                 projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
         except OSError as err:
-            print(err)
+            debugprint(err)
     # write data to memory-mapped array
     with tqdm(total=len(file_list), desc="Saving plane") as pbar:
         for z in range(shape[0]):
@@ -443,13 +445,13 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
             if stack_signature.specimen in shared_dict:
                 shared_dict[stack_signature.specimen].put(wrapped_z_projection)
             else:
-                print(f"Specimen signature not found in shared queue, signature: {stack_signature}")
-                # print(shared_dict)
+                debugprint(f"Specimen signature not found in shared queue, signature: {stack_signature}")
+                # debugprint(shared_dict)
         for axis in projections.keys():
             try:
                 imwrite(projections_files_path[axis], projections[axis])
             except Exception as err:
-                print(err)
+                debugprint(err)
 
         # we want to store projections derived from planes with different illumination modes to
         # have an option to merge them if the user checked the QCheckBox() in napari viewer GUI interface
@@ -467,7 +469,7 @@ def add_file_to_active_stacks(image_file: ImageFile):
     stack_signature = image_file.get_stack_signature()
     if stack_signature.signature not in active_stacks:
         active_stacks[stack_signature.signature] = {}
-        print(f"Adding stack {stack_signature.signature} to active queue.")
+        debugprint(f"Adding stack {stack_signature.signature} to active queue.")
     if image_file.plane not in active_stacks[stack_signature.signature]:
         active_stacks[stack_signature.signature][image_file.plane] = image_file
     return stack_signature
@@ -512,8 +514,12 @@ def load_lapse_parameters_json(file_path: str,
         lapse_parameters = json.load(j_file)
         j_file.close()
     except PermissionError:
-        print(f"{file_path} permission error, check if file is already opened")
+        debugprint(f"{file_path} permission error, check if file is already opened")
         return False
+    except Exception as e:
+        debugprint(
+            f"{file_path} failed to parse JSON", e)
+        
     if lapse_parameters:
         timestamp = os.path.basename(file_path).strip(".json").split("_")[1]
         lapse_parameters["output_folder"] = destination_folder
@@ -546,26 +552,30 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
     # load json parameters
     if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
         destination_folder = os.path.join(output_dir, os.path.basename(file_path).strip(".json"))
-        lapse_parameters = load_lapse_parameters_json(file_path, destination_folder)
-        if lapse_parameters:
-            json_dict.update(dict.fromkeys(*lapse_parameters))
-            # get specimens quantity
-            try:
-                SPECIMENS_QUANTITY = len(lapse_parameters[-1]['specimens'])
-                SPECIMENS_QUANTITY_LOADED = True
-            except Exception as err:
-                print(err)
-            if SPECIMENS_QUANTITY:
-                shared_dict.clear()
-                for i in range(0, SPECIMENS_QUANTITY):
-                    shared_dict[i] = manager.Queue()
-            PLOTTING_WINDOW_CREATED = False
+        json_parsing_result = load_lapse_parameters_json(
+            file_path, destination_folder)
+        if not json_parsing_result:
+            return
+        list_of_stack_signatures, metadata_json = json_parsing_result
+        json_dict.update(dict.fromkeys(
+            list_of_stack_signatures, metadata_json))
+        # get specimens quantity
+        try:
+            SPECIMENS_QUANTITY = len(metadata_json['specimens'])
+            SPECIMENS_QUANTITY_LOADED = True
+        except Exception as err:
+            debugprint(err)
+        if SPECIMENS_QUANTITY:
+            shared_dict.clear()
+            for i in range(0, SPECIMENS_QUANTITY):
+                shared_dict[i] = manager.Queue()
+        PLOTTING_WINDOW_CREATED = False
         try:
             if not os.path.exists(destination_folder):
                 os.mkdir(destination_folder)
                 shutil.move(file_path, destination_folder)
         except Exception as error:
-            print(error)
+            debugprint(error)
     else:
         if not file_path.endswith((".tif", ".bmp", ".tiff")):
             return
@@ -590,7 +600,7 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
                                                  axes,
                                                  factor)
         except KeyError:
-            print("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
+            debugprint("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
 
 
 def update_napari_viewer_layer():
@@ -664,7 +674,7 @@ def run_the_loop(kwargs):
     
 
     # Start the input directory observer
-    print(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
+    debugprint(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
     thread = Thread(target=watchfiles_thread, args=(input_dir,
                                                     output_dir,
                                                     shared_queues_of_z_projections,
@@ -699,7 +709,7 @@ def run_the_loop(kwargs):
                         line = fin.readline()
                         token, chat_id = line.strip().split(" ")
                     except Exception as err:
-                        print(err)
+                        debugprint(err)
 
             for i, _ in shared_queues_of_z_projections.items():
                 piv_process = PivProcess(
@@ -720,7 +730,7 @@ def run_the_loop(kwargs):
 
             # mode to process only max projections
             if process_z_projections:
-                print(f"Considering directory as Z projections source: {input_dir}, calculate"
+                debugprint(f"Considering directory as Z projections source: {input_dir}, calculate"
                       f" average speed and save data and plots to {output_dir}")
                 z_projections = os.listdir(input_dir)
                 z_projections.sort()
@@ -739,7 +749,7 @@ def run_the_loop(kwargs):
                                 else:
                                     break
                             shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
-                print(f"Finished with uploading projection files for quickPIV")
+                debugprint(f"Finished with uploading projection files for quickPIV")
 
         try:
             stop_file = os.path.join(input_dir, STOP_FILE_NAME)
@@ -754,9 +764,9 @@ def run_the_loop(kwargs):
                                f"sendMessage?chat_id={chat_id}&text={message}&disable_web_page_preview=true")
                         response = requests.get(url)
                         if response.status_code != 200:
-                            print(response.text)
-                            print(url)
-                    print(message)
+                            debugprint(response.text)
+                            debugprint(url)
+                    debugprint(message)
                 if process_z_projections:
                     # counter is used to check the list size approximately every minute
                     # if the avg_speed_data doesn't change - save the data and finish the pipeline
@@ -766,7 +776,7 @@ def run_the_loop(kwargs):
                         if len(speed_list_len) > 2:
                             speed_list_len.pop(0)
                             if speed_list_len[-1] == speed_list_len[-2]:
-                                print(f"No changes in quickPIV output queue, stop pipeline and save the data")
+                                debugprint(f"No changes in quickPIV output queue, stop pipeline and save the data")
                                 break
                 # Sleep to keep the script running
                 time.sleep(1)
@@ -796,9 +806,9 @@ def run_the_loop(kwargs):
                     w = csv.DictWriter(f_out, sorted_speed_data[0].keys())
                     w.writeheader()
                     w.writerows(sorted_speed_data)
-                    print(f"csv data saved to {output_dir}")
+                    debugprint(f"csv data saved to {output_dir}")
                 except IOError:
-                    print(f"Attempt to save csv data to {output_dir} failed")
+                    debugprint(f"Attempt to save csv data to {output_dir} failed")
             if process_z_projections:
                 df = pd.DataFrame(sorted_speed_data)
                 specimen_indices = df["specimen"].unique()
@@ -826,7 +836,7 @@ def run_the_loop(kwargs):
                                                  f"Specimen_{specimen_index}_avg_speed_"
                                                  f"{current_time.strftime('%H_%M_%S')}.png"))
                     except Exception as err:
-                        print(err)
+                        debugprint(err)
         if os.path.exists(stop_file) or process_z_projections:
             break
     thread.join()
@@ -941,7 +951,7 @@ def get_projections_dict_from_queue():
                         image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
                 DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
             else:
-                print("Empty projections dictionary")
+                debugprint("Empty projections dictionary")
         if image_layer_dict:
             return image_layer_dict
 
@@ -1064,7 +1074,7 @@ def update_avg_speed_plot_windows():
         try:
             PLT_WIDGETS_DICT[index].plot_curve(x, y, x_marker, y_marker)
         except KeyError:
-            print(f"window with index {index} doesn't exist")
+            debugprint(f"window with index {index} doesn't exist")
 
 
 def make_plotting_windows_visible():
@@ -1085,10 +1095,10 @@ def parse_message_from_microscope(message):
     time.sleep(0.01)
     try: 
         if message.get("type") == "exit":
-            print("Recieved terminate command from microscope.", file=sys.stderr)
+            debugprint("Recieved terminate command from microscope.")
             os._exit(1) # TODO: implement gracefull exit
         elif message.get("type") == "heartbeat":
-            print("Received heartbeat from the microscope.", file=sys.stderr)
+            debugprint("Received heartbeat from the microscope.")
     except:
         pass
 
@@ -1115,13 +1125,13 @@ def heartbeat_and_command_handler(port):
         events = dict(poller.poll(timeout))
         if socket in events:
             message = socket.recv_json()
-            print("Received message:", message, file=sys.stderr)
+            debugprint("Received message:", message)
             parse_message_from_microscope(message)
 
         # Send a heartbeat if it's time
         current_time = time.time()
         if current_time >= next_heartbeat_time:
-            print("Sending heartbeat to the microscope.", file=sys.stderr)
+            debugprint("Sending heartbeat to the microscope.")
             socket.send_json({"type": "heartbeat", "message": "alive"})
             last_heartbeat_time = current_time  # Update last heartbeat time
 
@@ -1185,13 +1195,13 @@ def main():
                 elif os.path.isdir(file_path):
                     shutil.rmtree(file_path)
             except Exception as e:
-                print(e)
+                debugprint(e)
     global VIEWER, PLT_WIDGETS_DICT
 
 
     # Allow other computers to attach to debugpy at this IP address and port.
     # debugpy.listen(('0.0.0.0', 5680))
-    # print("Waiting for debugger attach")
+    # debugprint("Waiting for debugger attach")
     # debugpy.wait_for_client()  # Blocks execution until client is attached
 
     thread = threading.Thread(
