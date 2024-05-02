@@ -629,23 +629,32 @@ async def read_input_files(input_folder,
                            manager,
                            factor,
                            axes):
-
-    async for changes in awatch(input_folder):
-        paths = []
-        for change in changes:
-            event, file_path = change
-            if event.value == 1:
-                paths.append(file_path)
-        if paths:
-            paths.sort()
-            for path in paths:
-                load_file_from_input_folder(path,
-                                            output_dir,
-                                            shared_queues_of_z_projections,
-                                            json_config,
-                                            manager,
-                                            factor,
-                                            axes)
+    try:
+        async for changes in awatch(input_folder):
+            paths = []
+            for change in changes:
+                event, file_path = change
+                if event.value == 1:  # Assuming '1' means 'file created' or similar
+                    paths.append(file_path)
+            if paths:
+                paths.sort()
+                for path in paths:
+                    try:
+                        load_file_from_input_folder(path,
+                                                    output_dir,
+                                                    shared_queues_of_z_projections,
+                                                    json_config,
+                                                    manager,
+                                                    factor,
+                                                    axes)
+                    except Exception as e:
+                        print(f"Error processing file {path}: {e}")
+    except Exception as e:
+        debugprint(f"Error watching directory {input_folder}: {e}")
+        command_queue_to_microscope.put("restartme")
+        time.sleep(0.5)
+        os._exit(1) # TODO: implement gracefull exit
+        
 
 
 def watchfiles_thread(*args):
