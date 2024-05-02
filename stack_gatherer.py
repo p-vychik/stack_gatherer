@@ -462,7 +462,10 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
             PROJECTIONS_QUEUE[wrapped_projections.identifier].append(wrapped_projections)
 
     for z in range(shape[0]):
-        os.remove(file_list[z])
+        try:
+            os.remove(file_list[z])
+        except PermissionError as e:
+            print(f"Error: {e}")
 
 
 def add_file_to_active_stacks(image_file: ImageFile):
