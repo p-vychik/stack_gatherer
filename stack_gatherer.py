@@ -527,9 +527,11 @@ def load_lapse_parameters_json(file_path: str,
         timestamp = os.path.basename(file_path).strip(".json").split("_")[1]
         lapse_parameters["output_folder"] = destination_folder
         setup_signature = []
-        for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
+        for spec_entry in lapse_parameters["specimens"]:
+            specimen_number = spec_entry["userDefinedIndex"]
             total_num_planes = spec_entry["number_of_planes"]
-            for channel_num, channel in enumerate(spec_entry["channels"]):
+            for channel in spec_entry["channels"]:
+                channel_num = channel["userDefinedIndex"]
                 active_illum = channel["lightsheetsEnabled"]
                 active_illum = [idx for idx, value in enumerate(active_illum) if value]
                 for illum in active_illum:
