@@ -1153,6 +1153,24 @@ def heartbeat_and_command_handler(port):
             command = command_queue_to_microscope.get_nowait()
             socket.send_json({"type": "command", "message": command})
 
+def correct_argv(argv):
+    corrected_argv = []
+    i = 0
+    while i < len(argv):
+        # Check presence of Windows drive letter followed by colon and quotation mark
+        # absence of the double slash after the colon results in incorrect arguments parsing
+        # when all arguments after the occurrence of quotation mark are parsed as one.
+
+        # look for presence of substrings E:" or E:\\" with a regex
+        if re.match(r'^[A-Za-z]:\"|^[A-Za-z]:\\{1,}\"', argv[i]):
+            corrected_argv.append(argv[i][:2])
+            concatenated_args = re.split(r'\s+', argv[i])
+            argv.extend(concatenated_args[1:])
+        else:
+            corrected_argv.append(argv[i])
+        i += 1
+    return corrected_argv
+
 
 def main():
     # Create the argument parser
@@ -1160,19 +1178,22 @@ def main():
                                                  "files as stacks to output directory.",
                                      argument_default=argparse.SUPPRESS)
     # Define the input_folder argument
-    parser.add_argument('-i', '--input', required=True, help="Input folder path to watch.")
+    parser.add_argument('-i', '--input', required=True,
+                        help="Input folder path to watch.")
 
     # Define the output_folder argument
-    parser.add_argument('-o', '--output', required=True, help="Output folder path to save stacks.")
+    parser.add_argument('-o', '--output', required=True,
+                        help="Output folder path to save stacks.")
 
     # Define axes to make projections
-    parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project "
-                                                       "on the plane, i.e. X,Y,Z or X, or X")
+    parser.add_argument('-a', '--axes', required=False,
+                        help="Comma separated axes to project on the plane, i.e. X,Y,Z or X, or X")
     # Define port for communication with MicroscopeController software
     parser.add_argument('-p', '--port', required=False, help="Integer value of the port")
 
     # Anisotropy factor correction
-    parser.add_argument('-f', '--factor_anisotropy', type=int, required=True if '--axes' in sys.argv else False,
+    parser.add_argument('-f', '--factor_anisotropy', type=int,
+                        required=True if '--axes' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
     # Specimen quantity
     parser.add_argument('--specimen_quantity', type=int,
@@ -1196,7 +1217,8 @@ def main():
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
 
     # Parse the command-line arguments
-    args = parser.parse_args()
+    corrected_args = correct_argv(sys.argv)
+    args = parser.parse_args(corrected_args[1:])
     if args.temp_dir is None:
         args.temp_dir = args.output
     if args.debug_run:
@@ -1218,9 +1240,12 @@ def main():
     # debugprint("Waiting for debugger attach")
     # debugpy.wait_for_client()  # Blocks execution until client is attached
 
-    thread = threading.Thread(
-        target=heartbeat_and_command_handler, args=(args.port,))
-    thread.start()
+    try:
+        thread = threading.Thread(
+            target=heartbeat_and_command_handler, args=(args.port,))
+        thread.start()
+    except Exception as e:
+        debugprint(f"{args},\n {e}")
     thread = Thread(target=run_the_loop, args=(vars(args), ))
     thread.start()
     VIEWER = make_napari_viewer()
