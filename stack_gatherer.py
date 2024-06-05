@@ -60,8 +60,6 @@ PIVJLPATH = ""
 SPECIMENS_QUANTITY_LOADED = False
 SPECIMENS_QUANTITY = 0
 PLOTTING_WINDOW_CREATED = False
-# gracefully terminate threads and exit if the value is set as True
-EXIT_SCRIPT = False
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
@@ -77,6 +75,8 @@ PIV_OUTPUT = multiprocessing.Queue()
 def debugprint(*args):
     print(*args, file=sys.stderr)
 # Define the main window class
+
+
 class PlottingWindow(QMainWindow, Ui_MainWindow):
     window_index = 0
 
@@ -756,7 +756,7 @@ def run_the_loop(kwargs, exit_gracefully):
             # mode to process only max projections
             if process_z_projections:
                 debugprint(f"Considering directory as Z projections source: {input_dir}, calculate"
-                      f" average speed and save data and plots to {output_dir}")
+                           f" average speed and save data and plots to {output_dir}")
                 z_projections = os.listdir(input_dir)
                 z_projections.sort()
                 for projection in z_projections:
@@ -1016,8 +1016,6 @@ def run_piv_process(shared_dict_queue: dict,
     x = []
     y = []
     while not stop_process.is_set():
-        # if stop_process.is_set():
-        #     break
         plane_matrix = queue_in.get()
         if plane_matrix:
             projections_to_process.put(plane_matrix)
@@ -1127,6 +1125,7 @@ def parse_message_from_microscope(message, exit_gracefully):
     except:
         pass
 
+
 def heartbeat_and_command_handler(port, exit_gracefully):
     context = zmq.Context()
     socket = context.socket(zmq.PAIR)
@@ -1137,13 +1136,14 @@ def heartbeat_and_command_handler(port, exit_gracefully):
     poller.register(socket, zmq.POLLIN)
 
     last_heartbeat_sent = time.time() - HEARTBEAT_INTERVAL_SEC
-    last_heartbeat_recieved = time.time() # initialize value with current time
-    incomming_heartbeats_timeout = 600 # timeout in seconds
+    last_heartbeat_recieved = time.time()  # initialize value with current time
+    incomming_heartbeats_timeout = 600  # timeout in seconds
 
     try:
         while not exit_gracefully.is_set():
             next_heartbeat_time = last_heartbeat_sent + HEARTBEAT_INTERVAL_SEC
             time_until_heartbeat = max(0, next_heartbeat_time - time.time())
+            # Timeout in milliseconds, max 50ms
             timeout = min(50, time_until_heartbeat * 1000)
 
             events = dict(poller.poll(timeout))
@@ -1174,8 +1174,9 @@ def heartbeat_and_command_handler(port, exit_gracefully):
         debugprint("disconnecting communication socket")
         socket.close()
         poller.unregister(socket)
-        context.term()  # Remove this line if it still causes blocking
+        context.term()
         debugprint("sending heartbeat stopped")
+
 
 def correct_argv(argv):
     corrected_argv = []
@@ -1265,7 +1266,6 @@ def main():
                 debugprint(e)
     global VIEWER, PLT_WIDGETS_DICT
 
-
     # Allow other computers to attach to debugpy at this IP address and port.
     # debugpy.listen(('0.0.0.0', 5680))
     # debugprint("Waiting for debugger attach")
@@ -1293,12 +1293,11 @@ def main():
     timer4.timeout.connect(lambda: close_napari_viewer(exit_gracefully))
     timer4.start(1000)
     napari.run()
-    print(f"Napari viewer windows was closed, terminating child processes")
+    debugprint(f"Napari viewer windows was closed, terminating child processes")
     exit_gracefully.set()
     thread.join()
     heartbeat_thread.join()
-    print(f"stack_gatherer stopped")
-
+    debugprint(f"stack_gatherer stopped")
 
 
 if __name__ == "__main__":
