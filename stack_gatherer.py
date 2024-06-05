@@ -60,6 +60,8 @@ PIVJLPATH = ""
 SPECIMENS_QUANTITY_LOADED = False
 SPECIMENS_QUANTITY = 0
 PLOTTING_WINDOW_CREATED = False
+# gracefully terminate threads and exit if the value is set as True
+EXIT_SCRIPT = False
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
@@ -630,40 +632,49 @@ async def read_input_files(input_folder,
                            json_config,
                            manager,
                            factor,
-                           axes):
+                           axes,
+                           exit_gracefully):
     try:
-        async for changes in awatch(input_folder):
-            paths = []
-            for change in changes:
-                event, file_path = change
-                if event.value == 1:  # Assuming '1' means 'file created' or similar
-                    paths.append(file_path)
-            if paths:
-                paths.sort()
-                for path in paths:
-                    try:
-                        load_file_from_input_folder(path,
-                                                    output_dir,
-                                                    shared_queues_of_z_projections,
-                                                    json_config,
-                                                    manager,
-                                                    factor,
-                                                    axes)
-                    except Exception as e:
-                        print(f"Error processing file {path}: {e}")
-    except Exception as e:
-        debugprint(f"Error watching directory {input_folder}: {e}")
-        command_queue_to_microscope.put("restartme")
-        time.sleep(0.5)
-        os._exit(1) # TODO: implement gracefull exit
-        
+        awatch_input_folder = awatch(input_folder)
+        while True:
+            try:
+                if exit_gracefully.is_set():
+                    break
+                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
+                paths = []
+                for change in changes:
+                    event, file_path = change
+                    if event.value == 1:  # Assuming '1' means 'file created' or similar
+                        paths.append(file_path)
+                if paths:
+                    paths.sort()
+                    for path in paths:
+                        try:
+                            load_file_from_input_folder(path,
+                                                        output_dir,
+                                                        shared_queues_of_z_projections,
+                                                        json_config,
+                                                        manager,
+                                                        factor,
+                                                        axes)
+                        except Exception as e:
+                            print(f"Error processing file {path}: {e}")
+            except asyncio.TimeoutError:
+                # Timeout is expected; just check the stop event again
+                continue
+            except StopAsyncIteration:
+                awatch_input_folder = awatch(input_folder)
+                continue
+    except Exception as err:
+        exit_gracefully.set()
+        debugprint(err)
 
 
 def watchfiles_thread(*args):
     asyncio.run(read_input_files(*args))
 
 
-def run_the_loop(kwargs):
+def run_the_loop(kwargs, exit_gracefully):
     global PIVJLPATH
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
@@ -685,8 +696,6 @@ def run_the_loop(kwargs):
     json_config = manager.dict()
     shared_queues_of_z_projections = manager.dict()
 
-    
-
     # Start the input directory observer
     debugprint(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
     thread = Thread(target=watchfiles_thread, args=(input_dir,
@@ -695,7 +704,9 @@ def run_the_loop(kwargs):
                                                     json_config,
                                                     manager,
                                                     factor,
-                                                    axes)
+                                                    axes,
+                                                    exit_gracefully),
+                    daemon=False
                     )
     thread.start()
 
@@ -769,7 +780,7 @@ def run_the_loop(kwargs):
             stop_file = os.path.join(input_dir, STOP_FILE_NAME)
             counter = 0
             speed_list_len = []
-            while not os.path.exists(stop_file) and not SPECIMENS_QUANTITY_LOADED:
+            while not os.path.exists(stop_file) and not SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
                 if migration_detected.qsize() > 0:
                     migration_event = migration_detected.get()
                     message = f"Detected on {migration_event}!"
@@ -798,7 +809,7 @@ def run_the_loop(kwargs):
                 stop_process.set()
         except KeyboardInterrupt:
             # Gracefully stop the observer if the script is interrupted
-            break
+            pass
 
         # terminate running quickPIV processes
         if piv_processes:
@@ -851,7 +862,7 @@ def run_the_loop(kwargs):
                                                  f"{current_time.strftime('%H_%M_%S')}.png"))
                     except Exception as err:
                         debugprint(err)
-        if os.path.exists(stop_file) or process_z_projections:
+        if os.path.exists(stop_file) or process_z_projections or exit_gracefully.is_set():
             break
     thread.join()
 
@@ -1004,9 +1015,9 @@ def run_piv_process(shared_dict_queue: dict,
     t = 0
     x = []
     y = []
-    while True:
-        if stop_process.is_set():
-            break
+    while not stop_process.is_set():
+        # if stop_process.is_set():
+        #     break
         plane_matrix = queue_in.get()
         if plane_matrix:
             projections_to_process.put(plane_matrix)
@@ -1105,53 +1116,66 @@ def make_plotting_windows_visible():
         PLOTTING_WINDOW_CREATED = True
 
 
-def parse_message_from_microscope(message):
+def parse_message_from_microscope(message, exit_gracefully):
     time.sleep(0.01)
     try: 
         if message.get("type") == "exit":
             debugprint("Recieved terminate command from microscope.")
-            os._exit(1) # TODO: implement gracefull exit
+            exit_gracefully.set()
         elif message.get("type") == "heartbeat":
             debugprint("Received heartbeat from the microscope.")
     except:
         pass
 
-def heartbeat_and_command_handler(port):
-    """Background thread function to send heartbeats and handle commands to the microscope."""
+def heartbeat_and_command_handler(port, exit_gracefully):
     context = zmq.Context()
     socket = context.socket(zmq.PAIR)
     socket.connect(f"tcp://localhost:{port}")
+    socket.setsockopt(zmq.LINGER, 0)  # Set linger to 0 to prevent blocking on close
 
-    # Set up a poller to allow for non-blocking waits on the socket
     poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)  # POLLIN for incoming messages
+    poller.register(socket, zmq.POLLIN)
 
-    last_heartbeat_time = time.time() - HEARTBEAT_INTERVAL_SEC
+    last_heartbeat_sent = time.time() - HEARTBEAT_INTERVAL_SEC
+    last_heartbeat_recieved = time.time() # initialize value with current time
+    incomming_heartbeats_timeout = 600 # timeout in seconds
 
-    while True:
-        # Check for the next heartbeat or frequent checks for the command queue
-        next_heartbeat_time = last_heartbeat_time + HEARTBEAT_INTERVAL_SEC
-        time_until_heartbeat = max(0, next_heartbeat_time - time.time())
-        # Timeout in milliseconds, max 50ms
-        timeout = min(50, time_until_heartbeat * 1000)
+    try:
+        while not exit_gracefully.is_set():
+            next_heartbeat_time = last_heartbeat_sent + HEARTBEAT_INTERVAL_SEC
+            time_until_heartbeat = max(0, next_heartbeat_time - time.time())
+            timeout = min(50, time_until_heartbeat * 1000)
 
-        # Poll the socket to check for new messages
-        events = dict(poller.poll(timeout))
-        if socket in events:
-            message = socket.recv_json()
-            debugprint("Received message:", message)
-            parse_message_from_microscope(message)
+            events = dict(poller.poll(timeout))
+            if socket in events:
+                message = socket.recv_json()
+                debugprint("Received message: " + str(message))
+                parse_message_from_microscope(message, exit_gracefully)
+                if message.get("type") == "heartbeat":
+                    last_heartbeat_recieved = time.time()
 
-        # Send a heartbeat if it's time
-        current_time = time.time()
-        if current_time >= next_heartbeat_time:
-            debugprint("Sending heartbeat to the microscope.")
-            socket.send_json({"type": "heartbeat", "message": "alive"})
-            last_heartbeat_time = current_time  # Update last heartbeat time
+            if time.time() - last_heartbeat_recieved > incomming_heartbeats_timeout:
+                exit_gracefully.set()
 
-        while not command_queue_to_microscope.empty():
-            command = command_queue_to_microscope.get_nowait()
-            socket.send_json({"type": "command", "message": command})
+            current_time = time.time()
+            if current_time >= next_heartbeat_time:
+                debugprint("Sending heartbeat to the microscope.")
+                socket.send_json({"type": "heartbeat", "message": "alive"})
+                last_heartbeat_sent = current_time
+
+            while not command_queue_to_microscope.empty():
+                command = command_queue_to_microscope.get_nowait()
+                socket.send_json({"type": "command", "message": command})
+
+    except Exception as e:
+        debugprint(f"Heartbeat handler exception: {e}")
+        exit_gracefully.set()
+    finally:
+        debugprint("disconnecting communication socket")
+        socket.close()
+        poller.unregister(socket)
+        context.term()  # Remove this line if it still causes blocking
+        debugprint("sending heartbeat stopped")
 
 def correct_argv(argv):
     corrected_argv = []
@@ -1170,6 +1194,11 @@ def correct_argv(argv):
             corrected_argv.append(argv[i])
         i += 1
     return corrected_argv
+
+
+def close_napari_viewer(stop_signal):
+    if stop_signal.is_set():
+        VIEWER.close()
 
 
 def main():
@@ -1216,6 +1245,8 @@ def main():
                         required=True if '--specimen_quantity' in sys.argv else False, action='store_true',
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
 
+    # event to stop the script gracefully
+    exit_gracefully = threading.Event()
     # Parse the command-line arguments
     corrected_args = correct_argv(sys.argv)
     args = parser.parse_args(corrected_args[1:])
@@ -1241,12 +1272,12 @@ def main():
     # debugpy.wait_for_client()  # Blocks execution until client is attached
 
     try:
-        thread = threading.Thread(
-            target=heartbeat_and_command_handler, args=(args.port,))
-        thread.start()
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_and_command_handler, args=(args.port, exit_gracefully))
+        heartbeat_thread.start()
     except Exception as e:
         debugprint(f"{args},\n {e}")
-    thread = Thread(target=run_the_loop, args=(vars(args), ))
+    thread = Thread(target=run_the_loop, args=(vars(args), exit_gracefully))
     thread.start()
     VIEWER = make_napari_viewer()
     timer1 = QTimer()
@@ -1258,8 +1289,16 @@ def main():
     timer3 = QTimer()
     timer3.timeout.connect(make_plotting_windows_visible)
     timer3.start(1000)
+    timer4 = QTimer()
+    timer4.timeout.connect(lambda: close_napari_viewer(exit_gracefully))
+    timer4.start(1000)
     napari.run()
+    print(f"Napari viewer windows was closed, terminating child processes")
+    exit_gracefully.set()
     thread.join()
+    heartbeat_thread.join()
+    print(f"stack_gatherer stopped")
+
 
 
 if __name__ == "__main__":
