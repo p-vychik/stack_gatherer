@@ -58,8 +58,9 @@ PLT_WIDGETS_DICT = {}
 TEMP_DIR = ""
 PIVJLPATH = ""
 SPECIMENS_QUANTITY_LOADED = False
-SPECIMENS_QUANTITY = 0
+SPECIMENS_QUANTITY = list()
 PLOTTING_WINDOW_CREATED = False
+plotting_windows_timer = QTimer()
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
@@ -84,8 +85,7 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
         super().__init__()
         # Initialize GUI
         self.setupUi(self)
-        self.window_index = window_index + 1
-        # PlottingWindow.window_index += 1
+        self.window_index = window_index
         self.setWindowTitle(f"QuickPIV average speed, specimen #{self.window_index}")
 
     def closeEvent(self, event):
@@ -568,13 +568,13 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
             list_of_stack_signatures, metadata_json))
         # get specimens quantity
         try:
-            SPECIMENS_QUANTITY = len(metadata_json['specimens'])
+            SPECIMENS_QUANTITY = [specimen_dict['userDefinedIndex'] for specimen_dict in metadata_json['specimens']]
             SPECIMENS_QUANTITY_LOADED = True
         except Exception as err:
             debugprint(err)
         if SPECIMENS_QUANTITY:
             shared_dict.clear()
-            for i in range(0, SPECIMENS_QUANTITY):
+            for i in SPECIMENS_QUANTITY:
                 shared_dict[i] = manager.Queue()
         PLOTTING_WINDOW_CREATED = False
         try:
@@ -633,7 +633,7 @@ async def read_input_files(input_folder,
                            manager,
                            factor,
                            axes,
-                           exit_gracefully):
+                           exit_gracefully: threading.Event):
     try:
         awatch_input_folder = awatch(input_folder)
         while True:
@@ -674,7 +674,7 @@ def watchfiles_thread(*args):
     asyncio.run(read_input_files(*args))
 
 
-def run_the_loop(kwargs, exit_gracefully):
+def run_the_loop(kwargs, exit_gracefully: threading.Event):
     global PIVJLPATH
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
@@ -721,11 +721,11 @@ def run_the_loop(kwargs, exit_gracefully):
 
             if specimen_quantity:
                 # update global variable to create plotting windows
-                SPECIMENS_QUANTITY = specimen_quantity
-                for i in range(0, specimen_quantity):
+                SPECIMENS_QUANTITY = (i + 1 for i in range(0, specimen_quantity))
+                for i in SPECIMENS_QUANTITY:
                     shared_queues_of_z_projections[i] = manager.Queue()
 
-            if SPECIMENS_QUANTITY:
+            if len(SPECIMENS_QUANTITY):
                 SPECIMENS_QUANTITY_LOADED = False
 
             if bot_config_path:
@@ -1012,6 +1012,7 @@ def run_piv_process(shared_dict_queue: dict,
     projections_to_process = Queue()
     migration_event_frame = set()
     queue_in = shared_dict_queue[queue_number]
+    debugprint(f"quickPIV process started, PID: {os.getpid()}")
     t = 0
     x = []
     y = []
@@ -1100,21 +1101,31 @@ def update_avg_speed_plot_windows():
             debugprint(f"window with index {index} doesn't exist")
 
 
-def make_plotting_windows_visible():
+def update_plotting_windows(exit_gracefully: threading.Event):
     global PLOTTING_WINDOW_CREATED
     global PLT_WIDGETS_DICT
+    global plotting_windows_timer
 
-    if PIVJLPATH and not PLOTTING_WINDOW_CREATED:
+    if exit_gracefully.is_set():
+        if len(PLT_WIDGETS_DICT) > 0:
+            for _, window in PLT_WIDGETS_DICT.items():
+                window.close()
+            return
+            plotting_windows_timer.stop()
+
+    if PLOTTING_WINDOW_CREATED:
+        return
+    if PIVJLPATH:
         if len(PLT_WIDGETS_DICT) > 0:
             # delete window from previous lapse
             PLT_WIDGETS_DICT = {}
-        for i in range(0, SPECIMENS_QUANTITY):
+        for i in SPECIMENS_QUANTITY:
             PLT_WIDGETS_DICT[i] = PlottingWindow(i)
             PLT_WIDGETS_DICT[i].show()
         PLOTTING_WINDOW_CREATED = True
 
 
-def parse_message_from_microscope(message, exit_gracefully):
+def parse_message_from_microscope(message, exit_gracefully: threading.Event):
     time.sleep(0.01)
     try: 
         if message.get("type") == "exit":
@@ -1126,7 +1137,8 @@ def parse_message_from_microscope(message, exit_gracefully):
         pass
 
 
-def heartbeat_and_command_handler(port, exit_gracefully):
+def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
+    debugprint(f"heartbeat process started")
     context = zmq.Context()
     socket = context.socket(zmq.PAIR)
     socket.connect(f"tcp://localhost:{port}")
@@ -1137,7 +1149,7 @@ def heartbeat_and_command_handler(port, exit_gracefully):
 
     last_heartbeat_sent = time.time() - HEARTBEAT_INTERVAL_SEC
     last_heartbeat_recieved = time.time()  # initialize value with current time
-    incomming_heartbeats_timeout = 600  # timeout in seconds
+    incomming_heartbeats_timeout = 60  # timeout in seconds
 
     try:
         while not exit_gracefully.is_set():
@@ -1197,8 +1209,8 @@ def correct_argv(argv):
     return corrected_argv
 
 
-def close_napari_viewer(stop_signal):
-    if stop_signal.is_set():
+def close_napari_viewer(exit_gracefully: threading.Event):
+    if exit_gracefully.is_set():
         VIEWER.close()
 
 
@@ -1264,7 +1276,7 @@ def main():
                     shutil.rmtree(file_path)
             except Exception as e:
                 debugprint(e)
-    global VIEWER, PLT_WIDGETS_DICT
+    global VIEWER, PLT_WIDGETS_DICT, plotting_windows_timer
 
     # Allow other computers to attach to debugpy at this IP address and port.
     # debugpy.listen(('0.0.0.0', 5680))
@@ -1286,12 +1298,12 @@ def main():
     timer2 = QTimer()
     timer2.timeout.connect(update_napari_viewer_layer)
     timer2.start(50)
-    timer3 = QTimer()
-    timer3.timeout.connect(make_plotting_windows_visible)
-    timer3.start(1000)
+    plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(exit_gracefully))
+    plotting_windows_timer.start(1000)
     timer4 = QTimer()
     timer4.timeout.connect(lambda: close_napari_viewer(exit_gracefully))
     timer4.start(1000)
+    debugprint(f"stack_gatherer started, PID: {os.getpid()}")
     napari.run()
     debugprint(f"Napari viewer windows was closed, terminating child processes")
     exit_gracefully.set()
