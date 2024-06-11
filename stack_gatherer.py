@@ -467,7 +467,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
         try:
             os.remove(file_list[z])
         except PermissionError as e:
-            print(f"Error: {e}")
+            debugprint(f"Error: {e}")
 
 
 def add_file_to_active_stacks(image_file: ImageFile):
@@ -636,11 +636,12 @@ async def read_input_files(input_folder,
                            exit_gracefully: threading.Event):
     try:
         awatch_input_folder = awatch(input_folder)
+        unfinished_run_check = False
         while True:
             try:
                 if exit_gracefully.is_set():
                     break
-                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
+                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=1.0)
                 paths = []
                 for change in changes:
                     event, file_path = change
@@ -660,6 +661,65 @@ async def read_input_files(input_folder,
                         except Exception as e:
                             print(f"Error processing file {path}: {e}")
             except asyncio.TimeoutError:
+                # check the presence of unfinished processing
+                if unfinished_run_check:
+                    continue
+                content = os.listdir(input_folder)
+                if not len(content):
+                    # proceed with normal run
+                    unfinished_run_check = True
+                    continue
+                unfinished_run_check = True
+                files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
+                # check json configuration in output_dir
+                # first get the timelapse id from file batch
+                lapse_ids = set()
+                json_path = ""
+                for f in files:
+                    if f.upper().endswith(".TIF") or f.upper().endswith(".BMP"):
+                        f_name_part = f.split("_TP")[0]
+                        f_name_part = f_name_part.split("timelapseID-")[1]
+                        lapse_ids.add(f_name_part)
+                if len(lapse_ids) == 0:
+                    debugprint(f"incorrect name pattern for existing files in {input_folder}")
+                    continue
+                if len(lapse_ids) == 1:
+                    # default case, find and load the json config and proceed with planes
+                    # first check the output folder for the config file
+                    id = lapse_ids.pop()
+                    # check the output directory for existence of a config file in a distinct folder
+                    if os.path.exists(os.path.join(output_dir, f"AcquisitionMetadata_{id}",
+                                                   f"AcquisitionMetadata_{id}.json")):
+                        json_path = os.path.join(output_dir, f"AcquisitionMetadata_{id}",
+                                                   f"AcquisitionMetadata_{id}.json")
+                    # check the content of the output directory
+                    elif os.path.exists(os.path.join(output_dir, f"AcquisitionMetadata_{id}.json")):
+                        json_path = os.path.join(output_dir, f"AcquisitionMetadata_{id}.json")
+                    # check the input folder for the config file presence
+                    elif os.path.exists(os.path.join(input_folder, f"AcquisitionMetadata_{id}.json")):
+                        json_path = os.path.join(input_folder, f"AcquisitionMetadata_{id}.json")
+                    else:
+                        debugprint(f"output and input directories do not contain the timelapse configuration file,"
+                                   f" planes from previous run won't be processed")
+                        continue
+                else:
+                    debugprint(f"Input folder {input_folder} contains image planes from multiple run, "
+                               f"resume the processing is not supported")
+                    continue
+                files = [os.path.join(input_folder, f) for f in files]
+                files.sort()
+                files.insert(0, json_path)
+                for path in files:
+                    try:
+                        load_file_from_input_folder(path,
+                                                    output_dir,
+                                                    shared_queues_of_z_projections,
+                                                    json_config,
+                                                    manager,
+                                                    factor,
+                                                    axes)
+                    except Exception as e:
+                        debugprint(f"Error processing file {path}: {e}")
                 # Timeout is expected; just check the stop event again
                 continue
             except StopAsyncIteration:
@@ -809,7 +869,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                 stop_process.set()
         except KeyboardInterrupt:
             # Gracefully stop the observer if the script is interrupted
-            pass
+            stop_process.set()
 
         # terminate running quickPIV processes
         if piv_processes:
