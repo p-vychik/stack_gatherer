@@ -732,6 +732,7 @@ async def read_input_files(input_folder,
 
 def watchfiles_thread(*args):
     asyncio.run(read_input_files(*args))
+    debugprint("watchfiles finished")
 
 
 def run_the_loop(kwargs, exit_gracefully: threading.Event):
@@ -776,7 +777,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
         stop_process = Event()
 
         if PIVJLPATH:
-            while not SPECIMENS_QUANTITY_LOADED and not process_z_projections:
+            while not SPECIMENS_QUANTITY_LOADED and not process_z_projections and not exit_gracefully.is_set():
                 time.sleep(1)
 
             if specimen_quantity:
