@@ -1396,7 +1396,6 @@ def main():
     timer4 = QTimer()
     timer4.timeout.connect(lambda: close_napari_viewer(exit_gracefully))
     timer4.start(1000)
-    # logging_broadcast(f"stack_gatherer started, PID: {os.getpid()}")
     napari.run()
     logging_broadcast(f"Napari viewer windows was closed, terminating child processes")
     exit_gracefully.set()
