@@ -20,6 +20,7 @@ import requests
 import threading
 import pandas as pd
 import matplotlib.pyplot as plt
+import logging
 from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
 from PIL import Image
@@ -39,8 +40,7 @@ from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QMainWindow
 from scipy.signal import find_peaks
 
-# import debugpy
-
+CURRENT_ACQUISITION_LOGGER = None
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
 ACQUISITION_META_FILE_PATTERN = "AcquisitionMetadata_"
 # BORDER_WIDTH defines the size of the border in pixels between
@@ -58,8 +58,9 @@ PLT_WIDGETS_DICT = {}
 TEMP_DIR = ""
 PIVJLPATH = ""
 SPECIMENS_QUANTITY_LOADED = False
-SPECIMENS_QUANTITY = 0
+SPECIMENS_QUANTITY = []
 PLOTTING_WINDOW_CREATED = False
+plotting_windows_timer = QTimer()
 active_stacks = {}
 currenty_saving_stacks_locks = {}
 currenty_saving_stacks_dict_lock = threading.Lock()
@@ -67,14 +68,49 @@ HEARTBEAT_INTERVAL_SEC = 5
 command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
 
-
 LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
 
 
-def debugprint(*args):
-    print(*args, file=sys.stderr)
-# Define the main window class
+def setup_main_logger(output_dir):
+    log_filename = os.path.join(output_dir, f"stack_gatherer_{datetime.now().strftime('%Y-%b-%d-%H%M%S')}.log")
+    logging.basicConfig(filename=log_filename,
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        datefmt='%d-%b-%y %H:%M:%S',
+                        level=logging.INFO)
+
+
+def setup_acquisition_log(lapse_output_folder: str):
+    global CURRENT_ACQUISITION_LOGGER
+
+    if not os.path.exists(lapse_output_folder):
+        os.mkdir(lapse_output_folder)
+    if CURRENT_ACQUISITION_LOGGER:
+        for handler in CURRENT_ACQUISITION_LOGGER.handlers:
+            handler.close()
+            CURRENT_ACQUISITION_LOGGER.removeHandler(handler)
+
+    CURRENT_ACQUISITION_LOGGER = logging.getLogger(f"acquisition_log")
+    log_filename = os.path.join(lapse_output_folder, f"{os.path.basename(lapse_output_folder).strip('.json')}.log")
+
+    file_handler = logging.FileHandler(log_filename)
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
+    file_handler.setFormatter(formatter)
+
+    CURRENT_ACQUISITION_LOGGER.addHandler(file_handler)
+    CURRENT_ACQUISITION_LOGGER.setLevel(logging.INFO)
+
+
+def logging_broadcast(string: str):
+    print(string, file=sys.stderr)
+    if CURRENT_ACQUISITION_LOGGER:
+        CURRENT_ACQUISITION_LOGGER.info(string)
+    else:
+        logging.getLogger('main_logger').info(string)
+    # logging.info(string)
+
+
 class PlottingWindow(QMainWindow, Ui_MainWindow):
     window_index = 0
 
@@ -82,8 +118,7 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
         super().__init__()
         # Initialize GUI
         self.setupUi(self)
-        self.window_index = window_index + 1
-        # PlottingWindow.window_index += 1
+        self.window_index = window_index
         self.setWindowTitle(f"QuickPIV average speed, specimen #{self.window_index}")
 
     def closeEvent(self, event):
@@ -122,7 +157,7 @@ class PivProcess(multiprocessing.Process):
     def exception(self):
         if self._pconn.poll():
             self._exception = self._pconn.recv()
-            debugprint(self._exception[0])
+            logging_broadcast(self._exception[0])
         return self._exception
 
 
@@ -306,7 +341,7 @@ def read_image(image_path):
             image = imread(image_path)
             return image
         except Exception as error:
-            debugprint(error)
+            logging_broadcast(error)
     if image_path.endswith(".bmp"):
         try:
             image = Image.open(image_path)
@@ -320,7 +355,7 @@ def read_image(image_path):
                 return np.asarray(image, dtype="uint16")
             return np.array(image)
         except Exception as error:
-            debugprint(error)
+            logging_broadcast(error)
     return False
 
 
@@ -386,7 +421,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
     imwrite(output_file_path, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
     # memory map numpy array to data in OME-TIFF file
     zyx_stack = memmap(output_file_path)
-    debugprint(f"Writing stack to {output_file_path}")
+    logging_broadcast(f"Writing stack to {output_file_path}")
     # prepare input about required projections in the dictionary,
     # the values of the appropriate keys would be the projection matrices
     projections = {}
@@ -402,7 +437,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                     os.makedirs(projection_folder_path)
                 projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
         except OSError as err:
-            debugprint(err)
+            logging_broadcast(err)
     # write data to memory-mapped array
     with tqdm(total=len(file_list), desc="Saving plane") as pbar:
         for z in range(shape[0]):
@@ -445,13 +480,12 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
             if stack_signature.specimen in shared_dict:
                 shared_dict[stack_signature.specimen].put(wrapped_z_projection)
             else:
-                debugprint(f"Specimen signature not found in shared queue, signature: {stack_signature}")
-                # debugprint(shared_dict)
+                logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
         for axis in projections.keys():
             try:
                 imwrite(projections_files_path[axis], projections[axis])
             except Exception as err:
-                debugprint(err)
+                logging_broadcast(err)
 
         # we want to store projections derived from planes with different illumination modes to
         # have an option to merge them if the user checked the QCheckBox() in napari viewer GUI interface
@@ -465,14 +499,14 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
         try:
             os.remove(file_list[z])
         except PermissionError as e:
-            print(f"Error: {e}")
+            logging_broadcast(f"Error: {e}")
 
 
 def add_file_to_active_stacks(image_file: ImageFile):
     stack_signature = image_file.get_stack_signature()
     if stack_signature.signature not in active_stacks:
         active_stacks[stack_signature.signature] = {}
-        debugprint(f"Adding stack {stack_signature.signature} to active queue.")
+        logging_broadcast(f"Adding stack {stack_signature.signature} to active queue.")
     if image_file.plane not in active_stacks[stack_signature.signature]:
         active_stacks[stack_signature.signature][image_file.plane] = image_file
     return stack_signature
@@ -517,19 +551,21 @@ def load_lapse_parameters_json(file_path: str,
         lapse_parameters = json.load(j_file)
         j_file.close()
     except PermissionError:
-        debugprint(f"{file_path} permission error, check if file is already opened")
+        logging_broadcast(f"{file_path} permission error, check if file is already opened")
         return False
     except Exception as e:
-        debugprint(
+        logging_broadcast(
             f"{file_path} failed to parse JSON", e)
-        
+
     if lapse_parameters:
         timestamp = os.path.basename(file_path).strip(".json").split("_")[1]
         lapse_parameters["output_folder"] = destination_folder
         setup_signature = []
-        for specimen_number, spec_entry in enumerate(lapse_parameters["specimens"]):
+        for spec_entry in lapse_parameters["specimens"]:
+            specimen_number = spec_entry["userDefinedIndex"]
             total_num_planes = spec_entry["number_of_planes"]
-            for channel_num, channel in enumerate(spec_entry["channels"]):
+            for channel in spec_entry["channels"]:
+                channel_num = channel["userDefinedIndex"]
                 active_illum = channel["lightsheetsEnabled"]
                 active_illum = [idx for idx, value in enumerate(active_illum) if value]
                 for illum in active_illum:
@@ -555,8 +591,8 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
     # load json parameters
     if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
         destination_folder = os.path.join(output_dir, os.path.basename(file_path).strip(".json"))
-        json_parsing_result = load_lapse_parameters_json(
-            file_path, destination_folder)
+        setup_acquisition_log(destination_folder)
+        json_parsing_result = load_lapse_parameters_json(file_path, destination_folder)
         if not json_parsing_result:
             return
         list_of_stack_signatures, metadata_json = json_parsing_result
@@ -564,21 +600,20 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
             list_of_stack_signatures, metadata_json))
         # get specimens quantity
         try:
-            SPECIMENS_QUANTITY = len(metadata_json['specimens'])
+            SPECIMENS_QUANTITY = [specimen_dict['userDefinedIndex'] for specimen_dict in metadata_json['specimens']]
             SPECIMENS_QUANTITY_LOADED = True
         except Exception as err:
-            debugprint(err)
-        if SPECIMENS_QUANTITY:
+            logging_broadcast(err)
+        if len(SPECIMENS_QUANTITY):
             shared_dict.clear()
-            for i in range(0, SPECIMENS_QUANTITY):
+            for i in SPECIMENS_QUANTITY:
                 shared_dict[i] = manager.Queue()
         PLOTTING_WINDOW_CREATED = False
         try:
-            if not os.path.exists(destination_folder):
-                os.mkdir(destination_folder)
+            if not os.path.exists(os.path.join(destination_folder, os.path.basename(file_path))):
                 shutil.move(file_path, destination_folder)
         except Exception as error:
-            debugprint(error)
+            logging_broadcast(error)
     else:
         if not file_path.endswith((".tif", ".bmp", ".tiff")):
             return
@@ -603,7 +638,7 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
                                                  axes,
                                                  factor)
         except KeyError:
-            debugprint("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
+            logging_broadcast("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
 
 
 def update_napari_viewer_layer():
@@ -628,17 +663,84 @@ async def read_input_files(input_folder,
                            json_config,
                            manager,
                            factor,
-                           axes):
+                           axes,
+                           exit_gracefully: threading.Event):
     try:
-        async for changes in awatch(input_folder):
-            paths = []
-            for change in changes:
-                event, file_path = change
-                if event.value == 1:  # Assuming '1' means 'file created' or similar
-                    paths.append(file_path)
-            if paths:
-                paths.sort()
-                for path in paths:
+        awatch_input_folder = awatch(input_folder)
+        unfinished_run_check = False
+        while True:
+            try:
+                if exit_gracefully.is_set():
+                    break
+                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
+                paths = []
+                for change in changes:
+                    event, file_path = change
+                    if event.value == 1:  # Assuming '1' means 'file created' or similar
+                        paths.append(file_path)
+                if paths:
+                    paths.sort()
+                    for path in paths:
+                        try:
+                            load_file_from_input_folder(path,
+                                                        output_dir,
+                                                        shared_queues_of_z_projections,
+                                                        json_config,
+                                                        manager,
+                                                        factor,
+                                                        axes)
+                        except Exception as e:
+                            logging_broadcast(f"Error processing file {path}: {e}")
+            except asyncio.TimeoutError:
+                # check the presence of unfinished processing
+                if unfinished_run_check:
+                    continue
+                content = os.listdir(input_folder)
+                if not len(content):
+                    # proceed with normal run
+                    unfinished_run_check = True
+                    continue
+                unfinished_run_check = True
+                files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
+                # check json configuration in output_dir
+                # first get the timelapse id from file batch
+                lapse_ids = set()
+                for f in files:
+                    if f.upper().endswith(".TIF") or f.upper().endswith(".BMP"):
+                        f_name_part = f.split("_TP")[0]
+                        f_name_part = f_name_part.split("timelapseID-")[1]
+                        lapse_ids.add(f_name_part)
+                if len(lapse_ids) == 0:
+                    logging_broadcast(f"incorrect name pattern for existing files in {input_folder}")
+                    continue
+                if len(lapse_ids) == 1:
+                    # default case, find and load the json config and proceed with planes
+                    # first check the output folder for the config file
+                    lapse_id = lapse_ids.pop()
+                    # check the output directory for existence of a config file in a distinct folder
+                    if os.path.exists(os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}",
+                                                   f"AcquisitionMetadata_{lapse_id}.json")):
+                        json_path = os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}",
+                                                 f"AcquisitionMetadata_{lapse_id}.json")
+                    # check the content of the output directory
+                    elif os.path.exists(os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}.json")):
+                        json_path = os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}.json")
+                    # check the input folder for the config file presence
+                    elif os.path.exists(os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")):
+                        json_path = os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")
+                    else:
+                        logging_broadcast(f"output and input directories do not contain "
+                                          f"the timelapse configuration file, "
+                                          f"planes from previous run won't be processed")
+                        continue
+                else:
+                    logging_broadcast(f"Input folder {input_folder} contains image planes from multiple run, "
+                                      f"resume the processing is not supported")
+                    continue
+                files = [os.path.join(input_folder, f) for f in files]
+                files.sort()
+                files.insert(0, json_path)
+                for path in files:
                     try:
                         load_file_from_input_folder(path,
                                                     output_dir,
@@ -648,20 +750,23 @@ async def read_input_files(input_folder,
                                                     factor,
                                                     axes)
                     except Exception as e:
-                        print(f"Error processing file {path}: {e}")
-    except Exception as e:
-        debugprint(f"Error watching directory {input_folder}: {e}")
-        command_queue_to_microscope.put("restartme")
-        time.sleep(0.5)
-        os._exit(1) # TODO: implement gracefull exit
-        
+                        logging_broadcast(f"Error processing file {path}: {e}")
+                # Timeout is expected; just check the stop event again
+                continue
+            except StopAsyncIteration:
+                awatch_input_folder = awatch(input_folder)
+                continue
+    except Exception as err:
+        exit_gracefully.set()
+        logging_broadcast(err)
 
 
 def watchfiles_thread(*args):
     asyncio.run(read_input_files(*args))
+    logging_broadcast("watchfiles finished")
 
 
-def run_the_loop(kwargs):
+def run_the_loop(kwargs, exit_gracefully: threading.Event):
     global PIVJLPATH
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
@@ -683,17 +788,17 @@ def run_the_loop(kwargs):
     json_config = manager.dict()
     shared_queues_of_z_projections = manager.dict()
 
-    
-
     # Start the input directory observer
-    debugprint(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
+    logging_broadcast(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
     thread = Thread(target=watchfiles_thread, args=(input_dir,
                                                     output_dir,
                                                     shared_queues_of_z_projections,
                                                     json_config,
                                                     manager,
                                                     factor,
-                                                    axes)
+                                                    axes,
+                                                    exit_gracefully),
+                    daemon=False
                     )
     thread.start()
 
@@ -703,16 +808,16 @@ def run_the_loop(kwargs):
         stop_process = Event()
 
         if PIVJLPATH:
-            while not SPECIMENS_QUANTITY_LOADED and not process_z_projections:
+            while not SPECIMENS_QUANTITY_LOADED and not process_z_projections and not exit_gracefully.is_set():
                 time.sleep(1)
 
             if specimen_quantity:
                 # update global variable to create plotting windows
-                SPECIMENS_QUANTITY = specimen_quantity
-                for i in range(0, specimen_quantity):
+                SPECIMENS_QUANTITY = [i + 1 for i in range(0, specimen_quantity)]
+                for i in SPECIMENS_QUANTITY:
                     shared_queues_of_z_projections[i] = manager.Queue()
 
-            if SPECIMENS_QUANTITY:
+            if len(SPECIMENS_QUANTITY):
                 SPECIMENS_QUANTITY_LOADED = False
 
             if bot_config_path:
@@ -721,7 +826,7 @@ def run_the_loop(kwargs):
                         line = fin.readline()
                         token, chat_id = line.strip().split(" ")
                     except Exception as err:
-                        debugprint(err)
+                        logging_broadcast(err)
 
             for i, _ in shared_queues_of_z_projections.items():
                 piv_process = PivProcess(
@@ -742,8 +847,8 @@ def run_the_loop(kwargs):
 
             # mode to process only max projections
             if process_z_projections:
-                debugprint(f"Considering directory as Z projections source: {input_dir}, calculate"
-                      f" average speed and save data and plots to {output_dir}")
+                logging_broadcast(f"Considering directory as Z projections source: {input_dir}, calculate"
+                                  f" average speed and save data and plots to {output_dir}")
                 z_projections = os.listdir(input_dir)
                 z_projections.sort()
                 for projection in z_projections:
@@ -761,13 +866,13 @@ def run_the_loop(kwargs):
                                 else:
                                     break
                             shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
-                debugprint(f"Finished with uploading projection files for quickPIV")
+                logging_broadcast(f"Finished with uploading projection files for quickPIV")
 
         try:
             stop_file = os.path.join(input_dir, STOP_FILE_NAME)
             counter = 0
             speed_list_len = []
-            while not os.path.exists(stop_file) and not SPECIMENS_QUANTITY_LOADED:
+            while not os.path.exists(stop_file) and not SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
                 if migration_detected.qsize() > 0:
                     migration_event = migration_detected.get()
                     message = f"Detected on {migration_event}!"
@@ -776,9 +881,9 @@ def run_the_loop(kwargs):
                                f"sendMessage?chat_id={chat_id}&text={message}&disable_web_page_preview=true")
                         response = requests.get(url)
                         if response.status_code != 200:
-                            debugprint(response.text)
-                            debugprint(url)
-                    debugprint(message)
+                            logging_broadcast(response.text)
+                            logging_broadcast(url)
+                    logging_broadcast(message)
                 if process_z_projections:
                     # counter is used to check the list size approximately every minute
                     # if the avg_speed_data doesn't change - save the data and finish the pipeline
@@ -788,7 +893,8 @@ def run_the_loop(kwargs):
                         if len(speed_list_len) > 2:
                             speed_list_len.pop(0)
                             if speed_list_len[-1] == speed_list_len[-2]:
-                                debugprint(f"No changes in quickPIV output queue, stop pipeline and save the data")
+                                logging_broadcast(f"No changes in quickPIV output queue, "
+                                                  f"stop pipeline and save the data")
                                 break
                 # Sleep to keep the script running
                 time.sleep(1)
@@ -796,7 +902,7 @@ def run_the_loop(kwargs):
                 stop_process.set()
         except KeyboardInterrupt:
             # Gracefully stop the observer if the script is interrupted
-            break
+            stop_process.set()
 
         # terminate running quickPIV processes
         if piv_processes:
@@ -818,9 +924,9 @@ def run_the_loop(kwargs):
                     w = csv.DictWriter(f_out, sorted_speed_data[0].keys())
                     w.writeheader()
                     w.writerows(sorted_speed_data)
-                    debugprint(f"csv data saved to {output_dir}")
+                    logging_broadcast(f"csv data saved to {output_dir}")
                 except IOError:
-                    debugprint(f"Attempt to save csv data to {output_dir} failed")
+                    logging_broadcast(f"Attempt to save csv data to {output_dir} failed")
             if process_z_projections:
                 df = pd.DataFrame(sorted_speed_data)
                 specimen_indices = df["specimen"].unique()
@@ -848,8 +954,8 @@ def run_the_loop(kwargs):
                                                  f"Specimen_{specimen_index}_avg_speed_"
                                                  f"{current_time.strftime('%H_%M_%S')}.png"))
                     except Exception as err:
-                        debugprint(err)
-        if os.path.exists(stop_file) or process_z_projections:
+                        logging_broadcast(err)
+        if os.path.exists(stop_file) or process_z_projections or exit_gracefully.is_set():
             break
     thread.join()
 
@@ -963,7 +1069,7 @@ def get_projections_dict_from_queue():
                         image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
                 DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
             else:
-                debugprint("Empty projections dictionary")
+                logging_broadcast("Empty projections dictionary")
         if image_layer_dict:
             return image_layer_dict
 
@@ -992,19 +1098,17 @@ def run_piv_process(shared_dict_queue: dict,
                     save_merged_illumination: bool,
                     output_dir: str
                     ):
-
     from juliacall import Main as jl
     jl.include(piv_path)
     piv_projection_queue = Queue()
     projections_to_process = Queue()
     migration_event_frame = set()
     queue_in = shared_dict_queue[queue_number]
+    logging_broadcast(f"quickPIV process started, PID: {os.getpid()}")
     t = 0
     x = []
     y = []
-    while True:
-        if stop_process.is_set():
-            break
+    while not stop_process.is_set():
         plane_matrix = queue_in.get()
         if plane_matrix:
             projections_to_process.put(plane_matrix)
@@ -1086,70 +1190,119 @@ def update_avg_speed_plot_windows():
         try:
             PLT_WIDGETS_DICT[index].plot_curve(x, y, x_marker, y_marker)
         except KeyError:
-            debugprint(f"window with index {index} doesn't exist")
+            logging_broadcast(f"window with index {index} doesn't exist")
 
 
-def make_plotting_windows_visible():
+def update_plotting_windows(exit_gracefully: threading.Event):
     global PLOTTING_WINDOW_CREATED
     global PLT_WIDGETS_DICT
+    global plotting_windows_timer
 
-    if PIVJLPATH and not PLOTTING_WINDOW_CREATED:
+    if exit_gracefully.is_set():
+        if len(PLT_WIDGETS_DICT) > 0:
+            for _, window in PLT_WIDGETS_DICT.items():
+                window.close()
+            plotting_windows_timer.stop()
+
+    if PLOTTING_WINDOW_CREATED:
+        return
+    if PIVJLPATH:
         if len(PLT_WIDGETS_DICT) > 0:
             # delete window from previous lapse
             PLT_WIDGETS_DICT = {}
-        for i in range(0, SPECIMENS_QUANTITY):
+        for i in SPECIMENS_QUANTITY:
             PLT_WIDGETS_DICT[i] = PlottingWindow(i)
             PLT_WIDGETS_DICT[i].show()
         PLOTTING_WINDOW_CREATED = True
 
 
-def parse_message_from_microscope(message):
+def parse_message_from_microscope(message, exit_gracefully: threading.Event):
     time.sleep(0.01)
-    try: 
+    try:
         if message.get("type") == "exit":
-            debugprint("Recieved terminate command from microscope.")
-            os._exit(1) # TODO: implement gracefull exit
+            logging_broadcast("Recieved terminate command from microscope.")
+            exit_gracefully.set()
         elif message.get("type") == "heartbeat":
-            debugprint("Received heartbeat from the microscope.")
+            logging_broadcast("Received heartbeat from the microscope.")
     except:
         pass
 
-def heartbeat_and_command_handler(port):
-    """Background thread function to send heartbeats and handle commands to the microscope."""
+
+def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
+    logging_broadcast(f"heartbeat process started")
     context = zmq.Context()
     socket = context.socket(zmq.PAIR)
     socket.connect(f"tcp://localhost:{port}")
+    socket.setsockopt(zmq.LINGER, 0)  # Set linger to 0 to prevent blocking on close
 
-    # Set up a poller to allow for non-blocking waits on the socket
     poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)  # POLLIN for incoming messages
+    poller.register(socket, zmq.POLLIN)
 
-    last_heartbeat_time = time.time() - HEARTBEAT_INTERVAL_SEC
+    last_heartbeat_sent = time.time() - HEARTBEAT_INTERVAL_SEC
+    last_heartbeat_recieved = time.time()  # initialize value with current time
+    incomming_heartbeats_timeout = 6000  # timeout in seconds
 
-    while True:
-        # Check for the next heartbeat or frequent checks for the command queue
-        next_heartbeat_time = last_heartbeat_time + HEARTBEAT_INTERVAL_SEC
-        time_until_heartbeat = max(0, next_heartbeat_time - time.time())
-        # Timeout in milliseconds, max 50ms
-        timeout = min(50, time_until_heartbeat * 1000)
+    try:
+        while not exit_gracefully.is_set():
+            next_heartbeat_time = last_heartbeat_sent + HEARTBEAT_INTERVAL_SEC
+            time_until_heartbeat = max(0, next_heartbeat_time - time.time())
+            # Timeout in milliseconds, max 50ms
+            timeout = min(50, time_until_heartbeat * 1000)
 
-        # Poll the socket to check for new messages
-        events = dict(poller.poll(timeout))
-        if socket in events:
-            message = socket.recv_json()
-            debugprint("Received message:", message)
-            parse_message_from_microscope(message)
+            events = dict(poller.poll(timeout))
+            if socket in events:
+                message = socket.recv_json()
+                logging_broadcast("Received message: " + str(message))
+                parse_message_from_microscope(message, exit_gracefully)
+                if message.get("type") == "heartbeat":
+                    last_heartbeat_recieved = time.time()
 
-        # Send a heartbeat if it's time
-        current_time = time.time()
-        if current_time >= next_heartbeat_time:
-            debugprint("Sending heartbeat to the microscope.")
-            socket.send_json({"type": "heartbeat", "message": "alive"})
-            last_heartbeat_time = current_time  # Update last heartbeat time
+            if time.time() - last_heartbeat_recieved > incomming_heartbeats_timeout:
+                exit_gracefully.set()
 
-        while not command_queue_to_microscope.empty():
-            command = command_queue_to_microscope.get_nowait()
-            socket.send_json({"type": "command", "message": command})
+            current_time = time.time()
+            if current_time >= next_heartbeat_time:
+                logging_broadcast("Sending heartbeat to the microscope.")
+                socket.send_json({"type": "heartbeat", "message": "alive"})
+                last_heartbeat_sent = current_time
+
+            while not command_queue_to_microscope.empty():
+                command = command_queue_to_microscope.get_nowait()
+                socket.send_json({"type": "command", "message": command})
+
+    except Exception as e:
+        logging_broadcast(f"Heartbeat handler exception: {e}")
+        exit_gracefully.set()
+    finally:
+        logging_broadcast("disconnecting communication socket")
+        socket.close()
+        poller.unregister(socket)
+        context.term()
+        logging_broadcast("sending heartbeat stopped")
+
+
+def correct_argv(argv):
+    corrected_argv = []
+    i = 0
+    while i < len(argv):
+        # Check presence of Windows drive letter followed by colon and quotation mark
+        # absence of the double slash after the colon results in incorrect arguments parsing
+        # when all arguments after the occurrence of quotation mark are parsed as one.
+
+        # look for presence of substrings E:" or E:\\" with a regex
+        if re.match(r'^[A-Za-z]:\"|^[A-Za-z]:\\{1,}\"', argv[i]):
+            corrected_argv.append(argv[i][:2])
+            concatenated_args = re.split(r'\s+', argv[i])
+            argv.extend(concatenated_args[1:])
+        else:
+            corrected_argv.append(argv[i])
+        i += 1
+    return corrected_argv
+
+
+def close_napari_viewer(exit_gracefully: threading.Event):
+    if exit_gracefully.is_set():
+        VIEWER.close()
 
 
 def main():
@@ -1158,19 +1311,22 @@ def main():
                                                  "files as stacks to output directory.",
                                      argument_default=argparse.SUPPRESS)
     # Define the input_folder argument
-    parser.add_argument('-i', '--input', required=True, help="Input folder path to watch.")
+    parser.add_argument('-i', '--input', required=True,
+                        help="Input folder path to watch.")
 
     # Define the output_folder argument
-    parser.add_argument('-o', '--output', required=True, help="Output folder path to save stacks.")
+    parser.add_argument('-o', '--output', required=True,
+                        help="Output folder path to save stacks.")
 
     # Define axes to make projections
-    parser.add_argument('-a', '--axes', required=False, help="Comma separated axes to project "
-                                                       "on the plane, i.e. X,Y,Z or X, or X")
+    parser.add_argument('-a', '--axes', required=False,
+                        help="Comma separated axes to project on the plane, i.e. X,Y,Z or X, or X")
     # Define port for communication with MicroscopeController software
     parser.add_argument('-p', '--port', required=False, help="Integer value of the port")
 
     # Anisotropy factor correction
-    parser.add_argument('-f', '--factor_anisotropy', type=int, required=True if '--axes' in sys.argv else False,
+    parser.add_argument('-f', '--factor_anisotropy', type=int,
+                        required=True if '--axes' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
     # Specimen quantity
     parser.add_argument('--specimen_quantity', type=int,
@@ -1193,10 +1349,15 @@ def main():
                         required=True if '--specimen_quantity' in sys.argv else False, action='store_true',
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
 
+    # event to stop the script gracefully
+    exit_gracefully = threading.Event()
     # Parse the command-line arguments
-    args = parser.parse_args()
+    corrected_args = correct_argv(sys.argv)
+    args = parser.parse_args(corrected_args[1:])
     if args.temp_dir is None:
         args.temp_dir = args.output
+    setup_main_logger(args.output)
+    logging.getLogger('watchfiles').setLevel(logging.WARNING)
     if args.debug_run:
         # for testing purposes only - empty the output folder before loading files
         for filename in os.listdir(args.output):
@@ -1207,19 +1368,21 @@ def main():
                 elif os.path.isdir(file_path):
                     shutil.rmtree(file_path)
             except Exception as e:
-                debugprint(e)
-    global VIEWER, PLT_WIDGETS_DICT
-
+                logging_broadcast(e)
+    global VIEWER, PLT_WIDGETS_DICT, plotting_windows_timer
 
     # Allow other computers to attach to debugpy at this IP address and port.
     # debugpy.listen(('0.0.0.0', 5680))
-    # debugprint("Waiting for debugger attach")
+    # logging_broadcast("Waiting for debugger attach")
     # debugpy.wait_for_client()  # Blocks execution until client is attached
 
-    thread = threading.Thread(
-        target=heartbeat_and_command_handler, args=(args.port,))
-    thread.start()
-    thread = Thread(target=run_the_loop, args=(vars(args), ))
+    try:
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_and_command_handler, args=(args.port, exit_gracefully))
+        heartbeat_thread.start()
+    except Exception as e:
+        logging_broadcast(f"{args},\n {e}")
+    thread = Thread(target=run_the_loop, args=(vars(args), exit_gracefully))
     thread.start()
     VIEWER = make_napari_viewer()
     timer1 = QTimer()
@@ -1228,11 +1391,18 @@ def main():
     timer2 = QTimer()
     timer2.timeout.connect(update_napari_viewer_layer)
     timer2.start(50)
-    timer3 = QTimer()
-    timer3.timeout.connect(make_plotting_windows_visible)
-    timer3.start(1000)
+    plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(exit_gracefully))
+    plotting_windows_timer.start(1000)
+    timer4 = QTimer()
+    timer4.timeout.connect(lambda: close_napari_viewer(exit_gracefully))
+    timer4.start(1000)
+    # logging_broadcast(f"stack_gatherer started, PID: {os.getpid()}")
     napari.run()
+    logging_broadcast(f"Napari viewer windows was closed, terminating child processes")
+    exit_gracefully.set()
     thread.join()
+    heartbeat_thread.join()
+    logging_broadcast(f"stack_gatherer stopped")
 
 
 if __name__ == "__main__":
