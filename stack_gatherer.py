@@ -1223,7 +1223,10 @@ def parse_message_from_microscope(message, exit_gracefully: threading.Event):
             logging_broadcast("Recieved terminate command from microscope.")
             exit_gracefully.set()
         elif message.get("type") == "heartbeat":
-            logging_broadcast("Received heartbeat from the microscope.")
+            # logging_broadcast("Received heartbeat from the microscope.")
+            pass
+        else:
+            logging_broadcast(f"Received message from the microscope: {str(message)}\nBut there is no action for it.")
     except:
         pass
 
@@ -1252,7 +1255,7 @@ def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
             events = dict(poller.poll(timeout))
             if socket in events:
                 message = socket.recv_json()
-                logging_broadcast("Received message: " + str(message))
+                # logging_broadcast("Received message: " + str(message))
                 parse_message_from_microscope(message, exit_gracefully)
                 if message.get("type") == "heartbeat":
                     last_heartbeat_recieved = time.time()
@@ -1262,7 +1265,7 @@ def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
 
             current_time = time.time()
             if current_time >= next_heartbeat_time:
-                logging_broadcast("Sending heartbeat to the microscope.")
+                # logging_broadcast("Sending heartbeat to the microscope.")
                 socket.send_json({"type": "heartbeat", "message": "alive"})
                 last_heartbeat_sent = current_time
 
