@@ -67,6 +67,8 @@ currenty_saving_stacks_dict_lock = threading.Lock()
 HEARTBEAT_INTERVAL_SEC = 5
 command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
+HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 10
+
 
 LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
@@ -1243,7 +1245,6 @@ def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
 
     last_heartbeat_sent = time.time() - HEARTBEAT_INTERVAL_SEC
     last_heartbeat_recieved = time.time()  # initialize value with current time
-    incomming_heartbeats_timeout = 6000  # timeout in seconds
 
     try:
         while not exit_gracefully.is_set():
@@ -1260,7 +1261,7 @@ def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
                 if message.get("type") == "heartbeat":
                     last_heartbeat_recieved = time.time()
 
-            if time.time() - last_heartbeat_recieved > incomming_heartbeats_timeout:
+            if time.time() - last_heartbeat_recieved > HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec:
                 exit_gracefully.set()
 
             current_time = time.time()
