@@ -171,8 +171,8 @@ class NotImagePlaneFile(Exception):
 class StackSignature:
     total_num_planes: int
     timelapse_id: str
-    time_point: int
     specimen: int
+    time_point: int
     illumination: int
     camera: int
     channel: int
@@ -182,7 +182,7 @@ class StackSignature:
             return tuple([val for attribute, val in self.__dict__.items() if attribute not in exclude_fields])
         if exclude_fields:
             return tuple([val for attribute, val in self.__dict__.items() if attribute != exclude_fields])
-        return (self.total_num_planes, self.timelapse_id, self.time_point, self.specimen,
+        return (self.total_num_planes, self.timelapse_id, self.specimen, self.time_point,
                 self.illumination, self.camera, self.channel)
 
     def __hash__(self) -> hash:
@@ -228,7 +228,7 @@ class ProjectionsDictWrapper:
 class ImageFile:
     """
     File naming for light-sheet image files.
-    Example file name: TP-0001_SPC-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150_blaBla.tif or .bmp
+    Example file name: SPC-0001_TP-0001_ILL-0_CAM-0_CH-01_PL-0001-outOf-0150_blaBla.tif or .bmp
     :param file_path: full path to image
     :type file_path: str
     """
@@ -247,7 +247,7 @@ class ImageFile:
     def __init__(self, file_path):
         self.path_to_image_dir = os.path.dirname(file_path)
         file_name = os.path.basename(file_path)
-        split_by = r"timelapseID-|TP-|SPC-|ILL-|CAM-|CH-|PL-|outOf-|\."
+        split_by = r"timelapseID-|SPC-|TP-|ILL-|CAM-|CH-|PL-|outOf-|\."
         name_parts = re.split(split_by, file_name)
 
         if len(name_parts) == 10:
@@ -259,9 +259,9 @@ class ImageFile:
                     elif i == 1:
                         self.timelapse_id = name_part.strip("-_")
                     elif i == 2:
-                        self.time_point = int(name_part.strip("-_"))
-                    elif i == 3:
                         self.specimen = int(name_part.strip("-_"))
+                    elif i == 3:
+                        self.time_point = int(name_part.strip("-_"))
                     elif i == 4:
                         self.illumination = int(name_part.strip("-_"))
                     elif i == 5:
@@ -298,8 +298,8 @@ class ImageFile:
             additional_info = "_" + additional_info
         if dataset_name != "":
             dataset_name = dataset_name + "_"
-        return (f"{dataset_name}timelapseID-{self.timelapse_id:}_TP-{self.time_point:04}"
-                f"_SPC-{self.specimen:04}_ILL-{self.illumination}"
+        return (f"{dataset_name}timelapseID-{self.timelapse_id:}_SPC-{self.specimen:04}"
+                f"_TP-{self.time_point:04}_ILL-{self.illumination}"
                 f"_CAM-{self.camera}_CH-{self.channel:02}"
                 f"_PL-{self.plane:04}-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}"
                 )
@@ -314,8 +314,8 @@ class ImageFile:
             additional_info = "_" + additional_info
         if dataset_name != "":
             dataset_name = dataset_name + "_"
-        return (f"{dataset_name}timelapseID-{self.timelapse_id:}_TP-{self.time_point:04}"
-                f"_SPC-{self.specimen:04}_ILL-{self.illumination}"
+        return (f"{dataset_name}timelapseID-{self.timelapse_id:}_SPC-{self.specimen:04}"
+                f"_TP-{self.time_point:04}_ILL-{self.illumination}"
                 f"_CAM-{self.camera}_CH-{self.channel:02}"
                 f"_PL-(ZS)-outOf-{self.total_num_planes:04}{additional_info}.{self.extension}"
                 )
@@ -329,8 +329,8 @@ class ImageFile:
     def get_stack_signature(self):
         return StackSignature(self.total_num_planes,
                               self.timelapse_id,
-                              self.time_point,
                               self.specimen,
+                              self.time_point,
                               self.illumination,
                               self.camera,
                               self.channel)
@@ -363,8 +363,8 @@ def read_image(image_path):
 
 def file_name_merged_illumination_based_on_signature(stack_signature):
     return (f"timelapseID-{stack_signature.timelapse_id}_"
-            f"TP-{stack_signature.time_point}_"
             f"SPC-{stack_signature.specimen}_"
+            f"TP-{stack_signature.time_point}_"
             f"ILL-MERGED_CAM-{stack_signature.camera}_"
             f"CH-{stack_signature.channel}_"
             f"Z_MAX_projection")

@@ -36,7 +36,7 @@ def setup_image_file_streaming_to_dir_with_tiffs():
     file_list = []
     for plane in range(num_planes):
         for ch in range(4):
-            file_path = os.path.join(images_dir, f"TP-0001_SPC-0001_ILL-0_CAM-0_CH-{ch:02}_PL-{plane:04}-outOf-{num_planes:04}.tif")
+            file_path = os.path.join(images_dir, f"SPC-0001_TP-0001_ILL-0_CAM-0_CH-{ch:02}_PL-{plane:04}-outOf-{num_planes:04}.tif")
             imwrite(file_path, numpy.random.randint(0, 2 ** 7, shape, dtype=dtype))
             file_list.append(file_path)
     # yield (file_list, acquisition_dir, stack_shape)
@@ -54,7 +54,7 @@ def setup_image_file_streaming_to_dir_with_bmps():
     file_list = []
     for plane in range(num_planes):
         for ch in range(4):
-            file_path = os.path.join(images_dir, f"TP-0001_SPC-0001_ILL-0_CAM-0_CH-{ch:02}_PL-{plane:04}-outOf-{num_planes:04}.bmp")
+            file_path = os.path.join(images_dir, f"SPC-0001_TP-0001_ILL-0_CAM-0_CH-{ch:02}_PL-{plane:04}-outOf-{num_planes:04}.bmp")
             output_image =  Image.fromarray(numpy.random.randint(0, 2 ** 7, shape, dtype=dtype))
             output_image.save(file_path)
             file_list.append(file_path)

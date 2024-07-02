@@ -97,7 +97,7 @@ Sends Telegram messages for specific events, such as the detection of migration 
 
 •  Arrival of image files with a correct file extension (.bmp, .tiff, .tif) triggers a check if the file is already added to the image stack with the method **check_stack_and_collect_if_ready()**. The check is based on a file signature derived from the file name mask:
 ```
-f"{dataset_name}timelapseID-{self.timelapse_id}_TP-{self.time_point}_SPC-{self.specimen}_ILL-{self.illumination}_CAM-{self.camera}_CH-{self.channel}_PL-{self.plane}-outOf-{self.total_num_planes}{additional_info}.{self.extension}"
+f"{dataset_name}timelapseID-{self.timelapse_id}_SPC-{self.specimen}_TP-{self.time_point}_ILL-{self.illumination}_CAM-{self.camera}_CH-{self.channel}_PL-{self.plane}-outOf-{self.total_num_planes}{additional_info}.{self.extension}"
 ```
 
 •  The signature of the image file is constructed as a tuple of values, extracted from the appropriate fields defined by the file name mask.
