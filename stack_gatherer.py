@@ -659,6 +659,33 @@ def update_napari_viewer_layer():
                     VIEWER.layers[axes_names].reset_contrast_limits()
 
 
+def get_config_files_for_each_unique_timelapse_id(output_folder, input_folder):
+    content = os.listdir(input_folder)
+    if len(content) == 0:
+        return
+    files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
+    lapse_ids = set()
+    for file_name in files:
+        lapse_ids.add(file_name.split("_SPC")[0].split("timelapseID-")[1])
+    config_files_locations = {}
+    for lapse_id in lapse_ids:
+        if os.path.exists(os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}",
+                                       f"AcquisitionMetadata_{lapse_id}.json")):
+            config_files_locations[lapse_id] = os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}",
+                                     f"AcquisitionMetadata_{lapse_id}.json")
+        # check the content of the output directory
+        elif os.path.exists(os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}.json")):
+            config_files_locations[lapse_id] = os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}.json")
+        # check the input folder for the config file presence
+        elif os.path.exists(os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")):
+            config_files_locations[lapse_id] = os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")
+        else:
+            logging_broadcast(f"output and input directories do not contain "
+                              f"the timelapse configuration file, for lapse id {lapse_id}"
+                              f"planes won't be processed")
+    return config_files_locations
+
+
 async def read_input_files(input_folder,
                            output_dir,
                            shared_queues_of_z_projections,
@@ -669,11 +696,43 @@ async def read_input_files(input_folder,
                            exit_gracefully: threading.Event):
     try:
         awatch_input_folder = awatch(input_folder)
-        unfinished_run_check = False
         while True:
             try:
                 if exit_gracefully.is_set():
                     break
+                config_files = get_config_files_for_each_unique_timelapse_id(output_dir, input_folder)
+                if config_files:
+                    for _, path in config_files.items():
+                        try:
+                            load_file_from_input_folder(path,
+                                                        output_dir,
+                                                        shared_queues_of_z_projections,
+                                                        json_config,
+                                                        manager,
+                                                        factor,
+                                                        axes)
+                        except Exception as e:
+                            logging_broadcast(f"Error processing file {path}: {e}")
+                    files = []
+                    for f in os.listdir(input_folder):
+                        if not os.path.isfile(os.path.join(input_folder, f)):
+                            continue
+                        if f.endswith(".json"):
+                            continue
+                        files.append(os.path.join(input_folder, f))
+                    files.sort()
+                    for path in files:
+                        try:
+                            load_file_from_input_folder(path,
+                                                        output_dir,
+                                                        shared_queues_of_z_projections,
+                                                        json_config,
+                                                        manager,
+                                                        factor,
+                                                        axes)
+                        except Exception as e:
+                            logging_broadcast(f"Error processing file {path}: {e}")
+
                 changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
                 paths = []
                 for change in changes:
@@ -694,67 +753,8 @@ async def read_input_files(input_folder,
                         except Exception as e:
                             logging_broadcast(f"Error processing file {path}: {e}")
             except asyncio.TimeoutError:
-                # check the presence of unfinished processing
-                if unfinished_run_check:
-                    continue
-                content = os.listdir(input_folder)
-                if not len(content):
-                    # proceed with normal run
-                    unfinished_run_check = True
-                    continue
-                unfinished_run_check = True
-                files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
-                # check json configuration in output_dir
-                # first get the timelapse id from file batch
-                lapse_ids = set()
-                for f in files:
-                    if f.upper().endswith(".TIF") or f.upper().endswith(".BMP"):
-                        f_name_part = f.split("_TP")[0]
-                        f_name_part = f_name_part.split("timelapseID-")[1]
-                        lapse_ids.add(f_name_part)
-                if len(lapse_ids) == 0:
-                    logging_broadcast(f"incorrect name pattern for existing files in {input_folder}")
-                    continue
-                if len(lapse_ids) == 1:
-                    # default case, find and load the json config and proceed with planes
-                    # first check the output folder for the config file
-                    lapse_id = lapse_ids.pop()
-                    # check the output directory for existence of a config file in a distinct folder
-                    if os.path.exists(os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}",
-                                                   f"AcquisitionMetadata_{lapse_id}.json")):
-                        json_path = os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}",
-                                                 f"AcquisitionMetadata_{lapse_id}.json")
-                    # check the content of the output directory
-                    elif os.path.exists(os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}.json")):
-                        json_path = os.path.join(output_dir, f"AcquisitionMetadata_{lapse_id}.json")
-                    # check the input folder for the config file presence
-                    elif os.path.exists(os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")):
-                        json_path = os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")
-                    else:
-                        logging_broadcast(f"output and input directories do not contain "
-                                          f"the timelapse configuration file, "
-                                          f"planes from previous run won't be processed")
-                        continue
-                else:
-                    logging_broadcast(f"Input folder {input_folder} contains image planes from multiple run, "
-                                      f"resume the processing is not supported")
-                    continue
-                files = [os.path.join(input_folder, f) for f in files]
-                files.sort()
-                files.insert(0, json_path)
-                for path in files:
-                    try:
-                        load_file_from_input_folder(path,
-                                                    output_dir,
-                                                    shared_queues_of_z_projections,
-                                                    json_config,
-                                                    manager,
-                                                    factor,
-                                                    axes)
-                    except Exception as e:
-                        logging_broadcast(f"Error processing file {path}: {e}")
-                # Timeout is expected; just check the stop event again
-                continue
+                if exit_gracefully.is_set():
+                    break
             except StopAsyncIteration:
                 awatch_input_folder = awatch(input_folder)
                 continue
