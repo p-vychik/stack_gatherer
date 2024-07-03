@@ -666,6 +666,8 @@ def get_config_files_for_each_unique_timelapse_id(output_folder, input_folder):
     files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
     lapse_ids = set()
     for file_name in files:
+        if file_name.upper().endswith("JSON"):
+            continue
         lapse_ids.add(file_name.split("_SPC")[0].split("timelapseID-")[1])
     config_files_locations = {}
     for lapse_id in lapse_ids:
@@ -713,6 +715,7 @@ async def read_input_files(input_folder,
                                                         axes)
                         except Exception as e:
                             logging_broadcast(f"Error processing file {path}: {e}")
+                    config_files = None
                     files = []
                     for f in os.listdir(input_folder):
                         if not os.path.isfile(os.path.join(input_folder, f)):
@@ -732,6 +735,7 @@ async def read_input_files(input_folder,
                                                         axes)
                         except Exception as e:
                             logging_broadcast(f"Error processing file {path}: {e}")
+
 
                 changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
                 paths = []
