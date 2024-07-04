@@ -1401,7 +1401,7 @@ def main():
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
     # When the microscope controller restarts the stack_gatherer, this argument defines the configuration file
     # of the unfinished image batch with which the processing will start
-    parser.add_argument('-r', '--restart', required=False,
+    parser.add_argument('-r', '--restart', required=False, default=None,
                         help=" defines the name of the AcquisitionMetadata file for unfinished image batch "
                              "with which the processing will start")
 
