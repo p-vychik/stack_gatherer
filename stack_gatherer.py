@@ -68,7 +68,7 @@ HEARTBEAT_INTERVAL_SEC = 5
 command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
 HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 10
-
+ACQUISITION_METADATA_FILE_TO_PROCESS = ""
 
 LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
@@ -659,32 +659,68 @@ def update_napari_viewer_layer():
                     VIEWER.layers[axes_names].reset_contrast_limits()
 
 
-def get_config_files_for_each_unique_timelapse_id(output_folder, input_folder):
+import os
+
+
+def find_config_files_locations(output_folder: str, input_folder: str, json_file_name=None) -> dict:
+    """
+    Returns the locations of time-lapse metadata files in JSON format based on corresponding timestamped names
+    of image planes from the batch for all files in the output_folder and input_folder.
+    Alternatively, if the metadata file name is specified with the json_file_name argument,
+    proceed with a direct check for its existence in the output_folder and input_folder
+
+    Args:
+    - output_folder (str): Path to the output folder to search for the JSON files.
+    - input_folder (str): Path to the input folder to search for the JSON files.
+    - json_file_name (str, optional): Name of the JSON file to find. If provided,
+      search will be restricted to finding this specific file.
+
+    Returns:
+    - dict: A dictionary mapping lapse IDs to the full paths of the JSON files found.
+            If json_file_name is provided, returns a dictionary with a single entry.
+    """
+    config_files_locations = {}
+
+    # If json_file_name is provided, directly check its presence
+    if json_file_name:
+        if os.path.exists(os.path.join(output_folder, json_file_name)):
+            config_files_locations[json_file_name] = os.path.join(output_folder, json_file_name)
+        elif os.path.exists(os.path.join(output_folder, os.path.splitext(json_file_name)[0], json_file_name)):
+            config_files_locations[json_file_name] = os.path.join(output_folder,
+                                                                  os.path.splitext(json_file_name)[0],
+                                                                  json_file_name)
+        elif os.path.exists(os.path.join(input_folder, json_file_name)):
+            config_files_locations[json_file_name] = os.path.join(input_folder, json_file_name)
+        return config_files_locations
+
+    # If json_file_name is not provided, continue with lapse ID-based search
     content = os.listdir(input_folder)
     if len(content) == 0:
-        return
+        return config_files_locations
+
     files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
     lapse_ids = set()
+
     for file_name in files:
         if file_name.upper().endswith("JSON"):
             continue
-        lapse_ids.add(file_name.split("_SPC")[0].split("timelapseID-")[1])
-    config_files_locations = {}
+        lapse_id = file_name.split("_SPC")[0].split("timelapseID-")[1]
+        lapse_ids.add(lapse_id)
+
     for lapse_id in lapse_ids:
-        if os.path.exists(os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}",
-                                       f"AcquisitionMetadata_{lapse_id}.json")):
+        if os.path.exists(
+                os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}", f"AcquisitionMetadata_{lapse_id}.json")):
             config_files_locations[lapse_id] = os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}",
-                                     f"AcquisitionMetadata_{lapse_id}.json")
-        # check the content of the output directory
+                                                            f"AcquisitionMetadata_{lapse_id}.json")
         elif os.path.exists(os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}.json")):
             config_files_locations[lapse_id] = os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}.json")
-        # check the input folder for the config file presence
         elif os.path.exists(os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")):
             config_files_locations[lapse_id] = os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")
         else:
-            logging_broadcast(f"output and input directories do not contain "
-                              f"the timelapse configuration file, for lapse id {lapse_id}"
-                              f"planes won't be processed")
+            logging_broadcast(
+                f"Neither the output nor input directories contain the timelapse configuration file "
+                f"for lapse id {lapse_id}. Processing of planes won't be initiated.")
+
     return config_files_locations
 
 
@@ -696,13 +732,20 @@ async def read_input_files(input_folder,
                            factor,
                            axes,
                            exit_gracefully: threading.Event):
+    global ACQUISITION_METADATA_FILE_TO_PROCESS
     try:
         awatch_input_folder = awatch(input_folder)
         while True:
             try:
                 if exit_gracefully.is_set():
                     break
-                config_files = get_config_files_for_each_unique_timelapse_id(output_dir, input_folder)
+                if ACQUISITION_METADATA_FILE_TO_PROCESS:
+                    config_files = find_config_files_locations(output_dir,
+                                                               input_folder,
+                                                               ACQUISITION_METADATA_FILE_TO_PROCESS)
+                    ACQUISITION_METADATA_FILE_TO_PROCESS = ""
+                else:
+                    config_files = find_config_files_locations(output_dir, input_folder)
                 if config_files:
                     for _, path in config_files.items():
                         try:
@@ -1356,6 +1399,11 @@ def main():
     parser.add_argument('-process_z_projections',
                         required=True if '--specimen_quantity' in sys.argv else False, action='store_true',
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
+    # When the microscope controller restarts the stack_gatherer, this argument defines the configuration file
+    # of the unfinished image batch with which the processing will start
+    parser.add_argument('-r', '--restart', required=False,
+                        help=" defines the name of the AcquisitionMetadata file for unfinished image batch "
+                             "with which the processing will start")
 
     # event to stop the script gracefully
     exit_gracefully = threading.Event()
@@ -1378,6 +1426,9 @@ def main():
             except Exception as e:
                 logging_broadcast(e)
     global VIEWER, PLT_WIDGETS_DICT, plotting_windows_timer
+    if args.restart:
+        global ACQUISITION_METADATA_FILE_TO_PROCESS
+        ACQUISITION_METADATA_FILE_TO_PROCESS = args.restart
 
     # Allow other computers to attach to debugpy at this IP address and port.
     # debugpy.listen(('0.0.0.0', 5680))
