@@ -67,7 +67,7 @@ currenty_saving_stacks_dict_lock = threading.Lock()
 HEARTBEAT_INTERVAL_SEC = 5
 command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
-HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 1000
+HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 100000
 
 LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
@@ -782,8 +782,12 @@ async def read_input_files(input_folder,
                            factor,
                            axes,
                            exit_gracefully: threading.Event,
-                           acquisition_metadata_to_process):
+                           acquisition_metadata_to_process,
+                           process_z_projections
+                           ):
     try:
+        global SPECIMENS_QUANTITY
+        global SPECIMENS_QUANTITY_LOADED
         awatch_input_folder = awatch(input_folder)
         unprocessed_lapse_ids = set()
         unprocessed_stack_signatures = set()
@@ -791,6 +795,20 @@ async def read_input_files(input_folder,
             try:
                 if exit_gracefully.is_set():
                     break
+
+                if process_z_projections:
+                    specimen_indices = set()
+                    for f in os.listdir(input_folder):
+                        if not os.path.isfile(os.path.join(input_folder, f)):
+                            continue
+                        match = re.search(r"(?<=SPC-)\d+", f)
+                        if match:
+                            # Convert the matched string to an integer
+                            specimen_indices.add(int(match.group()))
+                    if specimen_indices:
+                        SPECIMENS_QUANTITY.extend(sorted(specimen_indices))
+                        SPECIMENS_QUANTITY_LOADED = True
+
                 config_files = find_config_files_locations(output_dir,
                                                            input_folder,
                                                            acquisition_metadata_to_process,
@@ -883,7 +901,6 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     TEMP_DIR = kwargs.get("temp_dir", None)
     PIVJLPATH = kwargs.get("pivjl", None)
     bot_config_path = kwargs.get("bot_config", "")
-    specimen_quantity = kwargs.get("specimen_quantity", 0)
     process_z_projections = kwargs.get("process_z_projections", False)
     acquisition_metadata_to_process = kwargs.get("restart", "")
     token, chat_id = "", ""
@@ -903,7 +920,8 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                                                     factor,
                                                     axes,
                                                     exit_gracefully,
-                                                    acquisition_metadata_to_process),
+                                                    acquisition_metadata_to_process,
+                                                    process_z_projections),
                     daemon=False
                     )
     thread.start()
@@ -914,17 +932,12 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
         stop_process = Event()
 
         if PIVJLPATH:
-            while not SPECIMENS_QUANTITY_LOADED and not process_z_projections and not exit_gracefully.is_set():
+            while not SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
                 time.sleep(1)
 
-            if specimen_quantity:
-                # update global variable to create plotting windows
-                SPECIMENS_QUANTITY = [i + 1 for i in range(0, specimen_quantity)]
+            if process_z_projections:
                 for i in SPECIMENS_QUANTITY:
                     shared_queues_of_z_projections[i] = manager.Queue()
-
-            if len(SPECIMENS_QUANTITY):
-                SPECIMENS_QUANTITY_LOADED = False
 
             if bot_config_path:
                 with open(bot_config_path) as fin:
@@ -978,7 +991,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
             stop_file = os.path.join(input_dir, STOP_FILE_NAME)
             counter = 0
             speed_list_len = []
-            while not os.path.exists(stop_file) and not SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
+            while not os.path.exists(stop_file) and SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
                 if migration_detected.qsize() > 0:
                     migration_event = migration_detected.get()
                     message = f"Detected on {migration_event}!"
@@ -1256,7 +1269,7 @@ def run_piv_process(shared_dict_queue: dict,
                 # current_time = now.strftime("%H:%M:%S")
                 t += 1
                 x.append(t)
-                avg_speed_data.append({"time_point": t, "specimen": queue_number + 1, "avg_speed": avg_speed})
+                avg_speed_data.append({"time_point": t, "specimen": queue_number, "avg_speed": avg_speed})
                 try:
                     y.append(avg_speed)
                 except Exception as error:
@@ -1281,7 +1294,7 @@ def run_piv_process(shared_dict_queue: dict,
                         for frame in global_peaks_indices:
                             if frame not in migration_event_frame:
                                 migration_event_frame.add(frame)
-                                migration_detected.put(f"{frame}, specimen {queue_number + 1}")
+                                migration_detected.put(f"{frame}, specimen {queue_number}")
                     except Exception as error:
                         raise error
                 queue_out.put((queue_number, x, y, x_marker, y_marker))
@@ -1436,11 +1449,6 @@ def main():
     parser.add_argument('-f', '--factor_anisotropy', type=int,
                         required=True if '--axes' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
-    # Specimen quantity
-    parser.add_argument('--specimen_quantity', type=int,
-                        required=True if '-process_z_projections' in sys.argv else False,
-                        help="Value for number of specimens in the stage, defines number of plotting windows "
-                             "if json config is not available")
     # Move image files with incorrect name to the user provided directory
     parser.add_argument('--temp_dir', required=False,
                         default=None,
@@ -1454,7 +1462,7 @@ def main():
     parser.add_argument('-debug_run', required=False, default=False, action='store_true',
                         help="All content of --output specified folder will be DELETED!")
     parser.add_argument('-process_z_projections',
-                        required=True if '--specimen_quantity' in sys.argv else False, action='store_true',
+                        required=False, action='store_true',
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
     # When the microscope controller restarts the stack_gatherer, this argument defines the configuration file
     # of the unfinished image batch with which the processing will start
