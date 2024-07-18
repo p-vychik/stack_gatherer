@@ -56,7 +56,6 @@ VIEWER = None
 # separate matplotlib windows for each specimen
 PLT_WIDGETS_DICT = {}
 TEMP_DIR = ""
-PIVJLPATH = ""
 SPECIMENS_QUANTITY_LOADED = False
 SPECIMENS_QUANTITY = []
 PLOTTING_WINDOW_CREATED = False
@@ -67,7 +66,7 @@ currenty_saving_stacks_dict_lock = threading.Lock()
 HEARTBEAT_INTERVAL_SEC = 5
 command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
-HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 100000
+HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 100
 
 LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
@@ -889,7 +888,7 @@ def watchfiles_thread(*args):
 
 
 def run_the_loop(kwargs, exit_gracefully: threading.Event):
-    global PIVJLPATH
+    # global PIVJLPATH
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
     global SPECIMENS_QUANTITY
@@ -899,16 +898,18 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     axes = kwargs.get("axes", "Z")
     factor = kwargs.get("factor_anisotropy", None)
     TEMP_DIR = kwargs.get("temp_dir", None)
-    PIVJLPATH = kwargs.get("pivjl", None)
     bot_config_path = kwargs.get("bot_config", "")
     process_z_projections = kwargs.get("process_z_projections", False)
     acquisition_metadata_to_process = kwargs.get("restart", "")
     token, chat_id = "", ""
+    quickPIV_parameters = kwargs.get("quickPIV_parameters", "")
+    multiquickPIV_jl_path = kwargs.get("multiquickpivjl", "")
 
     piv_processes = []
     manager = Manager()
     json_config = manager.dict()
     shared_queues_of_z_projections = manager.dict()
+    stop_file = os.path.join(input_dir, STOP_FILE_NAME)
 
     # Start the input directory observer
     logging_broadcast(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
@@ -925,13 +926,36 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                     daemon=False
                     )
     thread.start()
+    quickpiv_run_file = [
+        'using PythonCall',
+        f"""include("{multiquickPIV_jl_path}")""",
+        'function fn(a1, a2)',
+        f"   {quickPIV_parameters}",
+        '   Us = []',
+        '   Vs = []',
+        '   pivparams = multi_quickPIV.setPIVParameters(interSize=IA, searchMargin=SM, step=ST, corr_alg="nsqecc", threshold=TH)',
+        '   VF, SN = multi_quickPIV.PIV(a1, a2, pivparams, precision=64)',
+        '   push!(Us, VF[1, :, :]);',
+        '   push!(Vs, VF[2, :, :])',
+        '   avg_speed = [sum(sqrt.(Us[t] .^ 2 + Vs[t] .^ 2)) / length(Us[t]) for t in 1:length(Us)]',
+        '   return avg_speed',
+        'end']
+
+    quick_piv_runner = os.path.join(output_dir, "avg_speed_quickPIV.jl")
+    if os.path.exists(quick_piv_runner):
+        try:
+            os.remove(quick_piv_runner)
+        except Exception as err:
+            logging_broadcast(err)
+    with open(f"{quick_piv_runner}", 'w') as f:
+        f.write(('\n').join(quickpiv_run_file))
 
     while True:
         migration_detected = manager.Queue()
         avg_speed_data = manager.list()
         stop_process = Event()
 
-        if PIVJLPATH:
+        if multiquickPIV_jl_path:
             while not SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
                 time.sleep(1)
 
@@ -953,7 +977,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                                                   PIV_OUTPUT,
                                                   avg_speed_data,
                                                   stop_process,
-                                                  PIVJLPATH,
+                                                  quick_piv_runner,
                                                   migration_detected,
                                                   i,
                                                   process_z_projections,
@@ -988,9 +1012,9 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                 logging_broadcast(f"Finished with uploading projection files for quickPIV")
 
         try:
-            stop_file = os.path.join(input_dir, STOP_FILE_NAME)
-            counter = 0
-            speed_list_len = []
+
+            check_next = time.time() + 60
+            speed_list_length = len(avg_speed_data)
             while not os.path.exists(stop_file) and SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
                 if migration_detected.qsize() > 0:
                     migration_event = migration_detected.get()
@@ -1004,20 +1028,18 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                             logging_broadcast(url)
                     logging_broadcast(message)
                 if process_z_projections:
-                    # counter is used to check the list size approximately every minute
+                    # check the data length change approximately every minute
                     # if the avg_speed_data doesn't change - save the data and finish the pipeline
-                    counter += 1
-                    if counter % 30 == 0:
-                        speed_list_len.append(len(avg_speed_data))
-                        if len(speed_list_len) > 2:
-                            speed_list_len.pop(0)
-                            if speed_list_len[-1] == speed_list_len[-2]:
-                                logging_broadcast(f"No changes in quickPIV output queue, "
-                                                  f"stop pipeline and save the data")
-                                break
+                    if check_next - time.time() <= 0:
+                        if speed_list_length == len(avg_speed_data):
+                            logging_broadcast(f"No changes in quickPIV output queue, "
+                                              f"stop pipeline and save the data")
+                            break
+                        check_next = time.time() + 60
+                        speed_list_length = len(avg_speed_data)
                 # Sleep to keep the script running
                 time.sleep(1)
-            if PIVJLPATH:
+            if process_z_projections:
                 stop_process.set()
         except KeyboardInterrupt:
             # Gracefully stop the observer if the script is interrupted
@@ -1075,6 +1097,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                     except Exception as err:
                         logging_broadcast(err)
         if os.path.exists(stop_file) or process_z_projections or exit_gracefully.is_set():
+            exit_gracefully.set()
             break
     thread.join()
 
@@ -1268,10 +1291,10 @@ def run_piv_process(shared_dict_queue: dict,
                     raise error
                 # current_time = now.strftime("%H:%M:%S")
                 t += 1
-                x.append(t)
                 avg_speed_data.append({"time_point": t, "specimen": queue_number, "avg_speed": avg_speed})
                 try:
                     y.append(avg_speed)
+                    x.append(t)
                 except Exception as error:
                     raise error
                 if len(x) > PLT_WIDGET_X_AXIS_LENGTH:
@@ -1325,14 +1348,13 @@ def update_plotting_windows(exit_gracefully: threading.Event):
 
     if PLOTTING_WINDOW_CREATED:
         return
-    if PIVJLPATH:
-        if len(PLT_WIDGETS_DICT) > 0:
-            # delete window from previous lapse
-            PLT_WIDGETS_DICT = {}
-        for i in SPECIMENS_QUANTITY:
-            PLT_WIDGETS_DICT[i] = PlottingWindow(i)
-            PLT_WIDGETS_DICT[i].show()
-        PLOTTING_WINDOW_CREATED = True
+    if len(PLT_WIDGETS_DICT) > 0:
+        # delete window from previous lapse
+        PLT_WIDGETS_DICT = {}
+    for i in SPECIMENS_QUANTITY:
+        PLT_WIDGETS_DICT[i] = PlottingWindow(i)
+        PLT_WIDGETS_DICT[i].show()
+    PLOTTING_WINDOW_CREATED = True
 
 
 def parse_message_from_microscope(message, exit_gracefully: threading.Event):
@@ -1453,9 +1475,9 @@ def main():
     parser.add_argument('--temp_dir', required=False,
                         default=None,
                         help="Directory path to store input images with incorrect file name")
-    parser.add_argument('--pivjl', required=True if '-process_z_projections' in sys.argv else False,
+    parser.add_argument('--multiquickpivjl', required=True if '-process_z_projections' in sys.argv else False,
                         default=False,
-                        help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
+                        help="Path to the multi_quickPIV.jl from quickPIV repository")
     parser.add_argument('--bot_config', required=False, default=False,
                         help="Path to text file with token and chat_id information (one line, space separator) for"
                              " supplying peaks detection on telegram messenger")
@@ -1469,12 +1491,15 @@ def main():
     parser.add_argument('-r', '--restart', required=False, default=None,
                         help=" defines the name of the AcquisitionMetadata file for unfinished image batch "
                              "with which the processing will start")
+    parser.add_argument('--quickPIV_parameters', required=True if '--multiquickpivjl'
+                                                                  in sys.argv else False)
 
     # event to stop the script gracefully
     exit_gracefully = threading.Event()
     # Parse the command-line arguments
     corrected_args = correct_argv(sys.argv)
     args = parser.parse_args(corrected_args[1:])
+
     if args.temp_dir is None:
         args.temp_dir = args.output
     setup_main_logger(args.output)
@@ -1498,6 +1523,7 @@ def main():
     # debugpy.wait_for_client()  # Blocks execution until client is attached
 
     try:
+        heartbeat_thread = None
         heartbeat_thread = threading.Thread(
             target=heartbeat_and_command_handler, args=(args.port, exit_gracefully))
         heartbeat_thread.start()
@@ -1521,7 +1547,8 @@ def main():
     logging_broadcast(f"Napari viewer windows was closed, terminating child processes")
     exit_gracefully.set()
     thread.join()
-    heartbeat_thread.join()
+    if heartbeat_thread is not None:
+        heartbeat_thread.join()
     logging_broadcast(f"stack_gatherer stopped")
 
 
