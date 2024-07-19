@@ -20,6 +20,7 @@ import requests
 import threading
 import pandas as pd
 import matplotlib.pyplot as plt
+import cv2
 import logging
 from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
@@ -134,6 +135,13 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
             self.plotWidget.canvas.axes.plot(x_marker, y_marker,
                                              color='red', marker='o',
                                              markersize=12, linewidth=0)
+            for xm, ym in zip(x_marker, y_marker):
+                self.plotWidget.canvas.axes.annotate(f"{xm}",
+                                                     xy=(xm, ym),
+                                                     xytext=(5, 5),
+                                                     textcoords='offset points',
+                                                     fontsize=10,
+                                                     color='black')
         self.plotWidget.canvas.axes.set_xticks(x)
         self.plotWidget.canvas.axes.set_xticklabels(x, fontsize=10)
         self.plotWidget.canvas.draw()
@@ -221,6 +229,10 @@ class ProjectionsDictWrapper:
     @property
     def stack_signature(self) -> StackSignature:
         return self.stack_signature_obj
+
+    @property
+    def specimen(self) -> int:
+        return self.stack_signature_obj.specimen
 
 
 class ImageFile:
@@ -368,6 +380,35 @@ def file_name_merged_illumination_based_on_signature(stack_signature):
             f"Z_MAX_projection")
 
 
+def fix_image_drift(ref_img, img):
+    # ORB detector
+    orb = cv2.ORB_create()
+
+    # detect keypoints and descriptors in images
+    kp_ref, des_ref = orb.detectAndCompute(ref_img, None)
+    kp_img, des_img = orb.detectAndCompute(img, None)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des_img, des_ref)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    # extract matches
+    points_ref = np.zeros((len(matches), 2), dtype=np.float32)
+    points_img = np.zeros((len(matches), 2), dtype=np.float32)
+
+    for i, match in enumerate(matches):
+        points_ref[i, :] = kp_ref[match.trainIdx].pt
+        points_img[i, :] = kp_img[match.queryIdx].pt
+
+    # find homography
+    h, mask = cv2.findHomography(points_img, points_ref, cv2.RANSAC)
+
+    # use homography to warp image
+    height, width = ref_img.shape
+    aligned_img = cv2.warpPerspective(img, h, (width, height))
+
+    return aligned_img
+
+
 def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
     """
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
@@ -447,6 +488,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
             return False
     # write data to memory-mapped array
     with tqdm(total=len(file_list), desc="Saving plane") as pbar:
+        ref_img = sample_image
         for z in range(shape[0]):
             if z == 0:
                 zyx_stack[z] = sample_image
@@ -462,6 +504,10 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                 pbar.update(1)
                 continue
             zyx_stack[z] = read_image(file_list[z])
+            # use BFMatcher to correct shift which may be present
+            aligned_img = fix_image_drift(ref_img, zyx_stack[z])
+            zyx_stack[z] = aligned_img
+            ref_img = aligned_img
             projections = plane_to_projection(zyx_stack[z], projections)
             zyx_stack.flush()
             pbar.update(1)
@@ -941,14 +987,13 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
             '   return avg_speed',
             'end']
         quick_piv_runner = os.path.join(output_dir, "avg_speed_quickPIV.jl")
-
-    if os.path.exists(quick_piv_runner):
         try:
-            os.remove(quick_piv_runner)
+            if os.path.exists(quick_piv_runner):
+                os.remove(quick_piv_runner)
+            with open(f"{quick_piv_runner}", 'w') as f:
+                f.write(('\n').join(quickpiv_run_file))
         except Exception as err:
             logging_broadcast(err)
-    with open(f"{quick_piv_runner}", 'w') as f:
-        f.write(('\n').join(quickpiv_run_file))
 
     while True:
         migration_detected = manager.Queue()
@@ -1082,6 +1127,13 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                     y = np.asarray(y)
                     peaks, _ = find_peaks(y, prominence=1.5)
                     ax.plot(peaks, y[peaks], color='red', marker='o', markersize=12, linewidth=0)
+                    for xm, ym in zip(peaks, y[peaks]):
+                        ax.annotate(f"{xm}",
+                                     xy=(xm, ym),
+                                     xytext=(5, 5),
+                                     textcoords='offset points',
+                                     fontsize=10,
+                                     color='black')
                     dec_x = []
                     for i, num in enumerate(x, start=1):
                         if i % 100 == 0:
@@ -1199,7 +1251,8 @@ def get_projections_dict_from_queue():
                 for wrapped_dict in projections_dict_list:
                     channel_layer = draw_napari_layer(wrapped_dict.projections)
                     for key, val in channel_layer.items():
-                        image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                        image_layer_dict[(f"Specimen_{wrapped_dict.specimen}_{key}"
+                                          f"_ILL_{wrapped_dict.illumination}")] = val
                 DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
         else:
             if projections_dict_list:
@@ -1208,7 +1261,8 @@ def get_projections_dict_from_queue():
                 for wrapped_dict in projections_dict_list:
                     channel_layer = draw_napari_layer(wrapped_dict.projections)
                     for key, val in channel_layer.items():
-                        image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                        image_layer_dict[(f"Specimen_{wrapped_dict.specimen}_{key}"
+                                          f"_ILL_{wrapped_dict.illumination}")] = val
                 DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
             else:
                 logging_broadcast("Empty projections dictionary")
@@ -1335,7 +1389,8 @@ def update_avg_speed_plot_windows():
             logging_broadcast(f"window with index {index} doesn't exist")
 
 
-def update_plotting_windows(exit_gracefully: threading.Event):
+def update_plotting_windows(exit_gracefully: threading.Event,
+                            multiquickpivjl: str):
     global PLOTTING_WINDOW_CREATED
     global PLT_WIDGETS_DICT
     global plotting_windows_timer
@@ -1346,7 +1401,7 @@ def update_plotting_windows(exit_gracefully: threading.Event):
                 window.close()
             plotting_windows_timer.stop()
 
-    if PLOTTING_WINDOW_CREATED:
+    if PLOTTING_WINDOW_CREATED or not multiquickpivjl:
         return
     if len(PLT_WIDGETS_DICT) > 0:
         # delete window from previous lapse
@@ -1540,7 +1595,7 @@ def main():
     timer2 = QTimer()
     timer2.timeout.connect(update_napari_viewer_layer)
     timer2.start(50)
-    plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(exit_gracefully))
+    plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(exit_gracefully, args.multiquickpivjl))
     plotting_windows_timer.start(1000)
     timer4 = QTimer()
     timer4.timeout.connect(lambda: close_napari_viewer(exit_gracefully))
