@@ -888,7 +888,6 @@ def watchfiles_thread(*args):
 
 
 def run_the_loop(kwargs, exit_gracefully: threading.Event):
-    # global PIVJLPATH
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
     global SPECIMENS_QUANTITY
@@ -926,22 +925,23 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                     daemon=False
                     )
     thread.start()
-    quickpiv_run_file = [
-        'using PythonCall',
-        f"""include("{multiquickPIV_jl_path}")""",
-        'function fn(a1, a2)',
-        f"   {quickPIV_parameters}",
-        '   Us = []',
-        '   Vs = []',
-        '   pivparams = multi_quickPIV.setPIVParameters(interSize=IA, searchMargin=SM, step=ST, corr_alg="nsqecc", threshold=TH)',
-        '   VF, SN = multi_quickPIV.PIV(a1, a2, pivparams, precision=64)',
-        '   push!(Us, VF[1, :, :]);',
-        '   push!(Vs, VF[2, :, :])',
-        '   avg_speed = [sum(sqrt.(Us[t] .^ 2 + Vs[t] .^ 2)) / length(Us[t]) for t in 1:length(Us)]',
-        '   return avg_speed',
-        'end']
+    if multiquickPIV_jl_path:
+        quickpiv_run_file = [
+            'using PythonCall',
+            f"""include("{multiquickPIV_jl_path}")""",
+            'function fn(a1, a2)',
+            f"   {quickPIV_parameters}",
+            '   Us = []',
+            '   Vs = []',
+            '   pivparams = multi_quickPIV.setPIVParameters(interSize=IA, searchMargin=SM, step=ST, corr_alg="nsqecc", threshold=TH)',
+            '   VF, SN = multi_quickPIV.PIV(a1, a2, pivparams, precision=64)',
+            '   push!(Us, VF[1, :, :]);',
+            '   push!(Vs, VF[2, :, :])',
+            '   avg_speed = [sum(sqrt.(Us[t] .^ 2 + Vs[t] .^ 2)) / length(Us[t]) for t in 1:length(Us)]',
+            '   return avg_speed',
+            'end']
+        quick_piv_runner = os.path.join(output_dir, "avg_speed_quickPIV.jl")
 
-    quick_piv_runner = os.path.join(output_dir, "avg_speed_quickPIV.jl")
     if os.path.exists(quick_piv_runner):
         try:
             os.remove(quick_piv_runner)
@@ -1492,7 +1492,9 @@ def main():
                         help=" defines the name of the AcquisitionMetadata file for unfinished image batch "
                              "with which the processing will start")
     parser.add_argument('--quickPIV_parameters', required=True if '--multiquickpivjl'
-                                                                  in sys.argv else False)
+                                                                  in sys.argv else False,
+                        help="Define IA,SM,ST,TH parameters (more about the arguments in QuickPIV documentation) "
+                             "as the string, without spaces e.g. 'IA,SM,ST,TH=(32,32),(16,16),(16,16),30'")
 
     # event to stop the script gracefully
     exit_gracefully = threading.Event()
