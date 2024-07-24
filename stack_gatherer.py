@@ -67,7 +67,7 @@ currenty_saving_stacks_dict_lock = threading.Lock()
 HEARTBEAT_INTERVAL_SEC = 5
 command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
-HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 100
+HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 1000
 
 LAYERS_INPUT = multiprocessing.Queue()
 PIV_OUTPUT = multiprocessing.Queue()
@@ -456,7 +456,8 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
     if os.path.exists(output_file_path):
         if stack_signature.signature not in unprocessed_stack_signatures:
             logging_broadcast(f"For image stack {stack_signature.signature} the output file {output_file_path} "
-                          f"already exists, processing skipped to prevent corruption of existing files in the folder")
+                              f"already exists, processing skipped to prevent corruption "
+                              f"of existing files in the folder")
             unprocessed_stack_signatures.add(stack_signature.signature)
         return False
     sample_image = read_image(file_list[0])
@@ -504,10 +505,11 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                 pbar.update(1)
                 continue
             zyx_stack[z] = read_image(file_list[z])
+            # doesn't work yet!
             # use BFMatcher to correct shift which may be present
-            aligned_img = fix_image_drift(ref_img, zyx_stack[z])
-            zyx_stack[z] = aligned_img
-            ref_img = aligned_img
+            # aligned_img = fix_image_drift(ref_img, zyx_stack[z])
+            # zyx_stack[z] = aligned_img
+            # ref_img = aligned_img
             projections = plane_to_projection(zyx_stack[z], projections)
             zyx_stack.flush()
             pbar.update(1)
@@ -722,18 +724,23 @@ def load_file_from_input_folder(file_path,
 
 def update_napari_viewer_layer():
     global LAYERS_INPUT
-    if LAYERS_INPUT.qsize() > 0:
-        data_input = LAYERS_INPUT.get()
-        for axes_names, image in data_input.items():
-            if axes_names not in VIEWER.layers:
-                VIEWER.add_image(image, name=axes_names)
-            else:
-                layer_image = VIEWER.layers[axes_names]
-                VIEWER.layers[axes_names].data = image
-                if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
-                    VIEWER.layers[axes_names].reset_contrast_limits()
-                if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
-                    VIEWER.layers[axes_names].reset_contrast_limits()
+    try:
+        if LAYERS_INPUT.qsize() > 0:
+            data_input = LAYERS_INPUT.get()
+            for axes_names, image in data_input.items():
+                if axes_names not in VIEWER.layers:
+                    VIEWER.add_image(image, name=axes_names)
+                    VIEWER.add_shapes(name=f"Subsample {axes_names} for quickPIV", shape_type='rectangle')
+                    VIEWER.layers[f"Subsample {axes_names} for quickPIV"].mouse_drag_callbacks.append(on_rectangle_selection)
+                else:
+                    layer_image = VIEWER.layers[axes_names]
+                    VIEWER.layers[axes_names].data = image
+                    if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
+                        VIEWER.layers[axes_names].reset_contrast_limits()
+                    if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
+                        VIEWER.layers[axes_names].reset_contrast_limits()
+    except Exception as err:
+        logging_broadcast(err)
 
 
 
@@ -937,6 +944,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
     global SPECIMENS_QUANTITY
+    global CROP_COORDINATES
 
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
@@ -954,6 +962,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     manager = Manager()
     json_config = manager.dict()
     shared_queues_of_z_projections = manager.dict()
+    cropping_coordinates_napari_selection = manager.dict()
     stop_file = os.path.join(input_dir, STOP_FILE_NAME)
 
     # Start the input directory observer
@@ -979,7 +988,8 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
             f"   {quickPIV_parameters}",
             '   Us = []',
             '   Vs = []',
-            '   pivparams = multi_quickPIV.setPIVParameters(interSize=IA, searchMargin=SM, step=ST, corr_alg="nsqecc", threshold=TH)',
+            '   pivparams = multi_quickPIV.setPIVParameters(interSize=IA, searchMargin=SM, '
+            'step=ST, corr_alg="nsqecc", threshold=TH)',
             '   VF, SN = multi_quickPIV.PIV(a1, a2, pivparams, precision=64)',
             '   push!(Us, VF[1, :, :]);',
             '   push!(Vs, VF[2, :, :])',
@@ -1129,11 +1139,11 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                     ax.plot(peaks, y[peaks], color='red', marker='o', markersize=12, linewidth=0)
                     for xm, ym in zip(peaks, y[peaks]):
                         ax.annotate(f"{xm}",
-                                     xy=(xm, ym),
-                                     xytext=(5, 5),
-                                     textcoords='offset points',
-                                     fontsize=10,
-                                     color='black')
+                                    xy=(xm, ym),
+                                    xytext=(5, 5),
+                                    textcoords='offset points',
+                                    fontsize=10,
+                                    color='black')
                     dec_x = []
                     for i, num in enumerate(x, start=1):
                         if i % 100 == 0:
@@ -1275,12 +1285,47 @@ def bx_trigger():
     MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
 
 
+def extract_and_display_selection(min_coords, max_coords):
+    try:
+        for layer in VIEWER.layers:
+            if isinstance(layer, napari.layers.Image):
+                image_data = layer.data
+                selected_region = image_data[
+                    min_coords[0]:max_coords[0],
+                    min_coords[1]:max_coords[1]
+                ]
+                # VIEWER.add_image(selected_region, name=f'Selection from {layer.name}')
+                imwrite(f"F:/cropping_data/{layer.name}_{time.time()}.tiff", selected_region)
+                break
+    except Exception as err:
+        logging_broadcast(f"extract_and_display_{err}")
+
+
+def on_rectangle_selection(layer, event):
+    shapes_layer = layer
+    # Check if the current tool is the rectangle tool
+    logging_broadcast(f"mouse release fired {shapes_layer.name}")
+    logging_broadcast("release mode fired")
+    if len(shapes_layer.data) > 0 and event.type == "mouse_press" and shapes_layer.mode == "add_rectangle":
+        rectangle = shapes_layer.data.pop()  # Get the last drawn rectangle
+        shapes_layer.data = []
+        shapes_layer.data.append(rectangle)
+        logging_broadcast(f"{rectangle}")
+        min_coords = np.min(rectangle, axis=0).astype(int)
+        max_coords = np.max(rectangle, axis=0).astype(int)
+        extract_and_display_selection(min_coords, max_coords)
+
+
 def make_napari_viewer():
     napari_viewer = napari.Viewer()
     bx = QCheckBox('Merge illumination channels')
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     napari_viewer.window.add_dock_widget(bx)
+    # Add shapes layer for rectangle selection
+    # shapes_layer = napari_viewer.add_shapes(name='Rectangle', shape_type='rectangle')
+    # shapes_layer.mode = 'add_rectangle'
+    # shapes_layer.events.data.connect(on_rectangle_selection)
     return napari_viewer
 
 
@@ -1416,7 +1461,7 @@ def parse_message_from_microscope(message, exit_gracefully: threading.Event):
     time.sleep(0.01)
     try:
         if message.get("type") == "exit":
-            logging_broadcast("Recieved terminate command from microscope.")
+            logging_broadcast("Received terminate command from microscope.")
             exit_gracefully.set()
         elif message.get("type") == "heartbeat":
             # logging_broadcast("Received heartbeat from the microscope.")
