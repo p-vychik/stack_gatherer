@@ -479,7 +479,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
             # push to the queue for PIV calculations
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
             # here we should put the projection with clear identification of species and other parameters
-            if stack_signature.specimen in shared_dict:
+            if stack_signature.specimen in shared_dict and PIVJLPATH:
                 shared_dict[stack_signature.specimen].put(wrapped_z_projection)
             else:
                 logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
@@ -657,9 +657,6 @@ def update_napari_viewer_layer():
                     VIEWER.layers[axes_names].reset_contrast_limits()
                 if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
                     VIEWER.layers[axes_names].reset_contrast_limits()
-
-
-import os
 
 
 def find_config_files_locations(output_folder: str, input_folder: str, json_file_name=None) -> dict:
