@@ -33,7 +33,7 @@ from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Manager, Event
-
+from memory_profiler import profile
 import zmq
 from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import QTimer
@@ -343,7 +343,7 @@ def read_image(image_path):
             image = imread(image_path)
             return image
         except Exception as error:
-            logging_broadcast(error)
+            logging_broadcast(f"read_image {error}")
     if image_path.endswith(".bmp"):
         try:
             image = Image.open(image_path)
@@ -357,7 +357,7 @@ def read_image(image_path):
                 return np.asarray(image, dtype="uint16")
             return np.array(image)
         except Exception as error:
-            logging_broadcast(error)
+            logging_broadcast(f"read_image {error}")
     return False
 
 
@@ -406,21 +406,20 @@ def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
 
 
 def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSignature,
-                                                     file_list,
-                                                     output_file_path,
-                                                     shared_dict,
+                                                     file_list: list,
+                                                     output_file_path: str,
+                                                     shared_dict=None,
                                                      axes=None,
                                                      anisotropy_factor=1,
                                                      output_dir=None):
-    if os.path.exists(output_file_path):
-        return
     sample_image = read_image(file_list[0])
     if isinstance(sample_image, bool):
         return
     shape = (len(file_list), sample_image.shape[0], sample_image.shape[1])
     dtype = sample_image.dtype
     # create an empty OME-TIFF file
-    imwrite(output_file_path, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
+    if not os.path.exists(output_file_path):
+        imwrite(output_file_path, shape=shape, dtype=dtype, metadata={'axes': 'ZYX'})
     # memory map numpy array to data in OME-TIFF file
     zyx_stack = memmap(output_file_path)
     logging_broadcast(f"Writing stack to {output_file_path}")
@@ -438,8 +437,8 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                 if not os.path.exists(projection_folder_path):
                     os.makedirs(projection_folder_path)
                 projections_files_path[axis] = os.path.join(projection_folder_path, file_name)
-        except OSError as err:
-            logging_broadcast(err)
+        except Exception as err:
+            logging_broadcast(f" collect_files_to_one_stack_get_axial_projections {err}")
     # write data to memory-mapped array
     with tqdm(total=len(file_list), desc="Saving plane") as pbar:
         for z in range(shape[0]):
@@ -479,15 +478,17 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
             # push to the queue for PIV calculations
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
             # here we should put the projection with clear identification of species and other parameters
-            if stack_signature.specimen in shared_dict and PIVJLPATH:
-                shared_dict[stack_signature.specimen].put(wrapped_z_projection)
-            else:
-                logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
+            if shared_dict is not None:
+                if stack_signature.specimen:
+                    shared_dict[stack_signature.specimen].put(wrapped_z_projection)
+                else:
+                    logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
         for axis in projections.keys():
             try:
-                imwrite(projections_files_path[axis], projections[axis])
+                if not os.path.exists(projections_files_path[axis]):
+                    imwrite(projections_files_path[axis], projections[axis])
             except Exception as err:
-                logging_broadcast(err)
+                logging_broadcast(f"Can't save the projection file, {err}")
 
         # we want to store projections derived from planes with different illumination modes to
         # have an option to merge them if the user checked the QCheckBox() in napari viewer GUI interface
@@ -500,8 +501,8 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
     for z in range(shape[0]):
         try:
             os.remove(file_list[z])
-        except PermissionError as e:
-            logging_broadcast(f"Error: {e}")
+        except PermissionError as err:
+            logging_broadcast(f"Can't remove the plane file: {err}")
 
 
 def add_file_to_active_stacks(image_file: ImageFile):
@@ -591,22 +592,26 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
     if os.path.isdir(file_path):
         return
     # load json parameters
-    if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
+    if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.lower().endswith(".json"):
         destination_folder = os.path.join(output_dir, os.path.basename(file_path).strip(".json"))
         setup_acquisition_log(destination_folder)
+        logging_broadcast(f"new logger is set, prepare to parse JSON {file_path}")
         json_parsing_result = load_lapse_parameters_json(file_path, destination_folder)
         if not json_parsing_result:
+            logging_broadcast(f"{file_path} parsing as JSON file failed")
             return
         list_of_stack_signatures, metadata_json = json_parsing_result
-        json_dict.update(dict.fromkeys(
-            list_of_stack_signatures, metadata_json))
+        logging_broadcast("update json dict ")
+        new_keys = [key for key in list_of_stack_signatures if key not in json_dict]
+        if new_keys:
+            json_dict.update(dict.fromkeys(new_keys, metadata_json))
         # get specimens quantity
         try:
             SPECIMENS_QUANTITY = [specimen_dict['userDefinedIndex'] for specimen_dict in metadata_json['specimens']]
             SPECIMENS_QUANTITY_LOADED = True
         except Exception as err:
-            logging_broadcast(err)
-        if len(SPECIMENS_QUANTITY):
+            logging_broadcast(f"load_file_from_input_folder {err}")
+        if len(SPECIMENS_QUANTITY) and shared_dict is not None:
             shared_dict.clear()
             for i in SPECIMENS_QUANTITY:
                 shared_dict[i] = manager.Queue()
@@ -615,10 +620,8 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
             if not os.path.exists(os.path.join(destination_folder, os.path.basename(file_path))):
                 shutil.move(file_path, destination_folder)
         except Exception as error:
-            logging_broadcast(error)
-    else:
-        if not file_path.endswith((".tif", ".bmp", ".tiff")):
-            return
+            logging_broadcast(f"load_file_from_input_folder {error}")
+    if file_path.upper().endswith((".TIFF", ".BMP", ".TIF")):
         # Call the function when a new file is created
         try:
             file = ImageFile(file_path)
@@ -677,9 +680,8 @@ def find_config_files_locations(output_folder: str, input_folder: str, json_file
             If json_file_name is provided, returns a dictionary with a single entry.
     """
     config_files_locations = {}
+    def collect_jsons(json_file_name):
 
-    # If json_file_name is provided, directly check its presence
-    if json_file_name:
         if os.path.exists(os.path.join(output_folder, json_file_name)):
             config_files_locations[json_file_name] = os.path.join(output_folder, json_file_name)
         elif os.path.exists(os.path.join(output_folder, os.path.splitext(json_file_name)[0], json_file_name)):
@@ -690,9 +692,15 @@ def find_config_files_locations(output_folder: str, input_folder: str, json_file
             config_files_locations[json_file_name] = os.path.join(input_folder, json_file_name)
         return config_files_locations
 
+
+    # If json_file_name is provided, directly check its presence
+    if json_file_name:
+        collect_jsons(json_file_name)
+
     # If json_file_name is not provided, continue with lapse ID-based search
     content = os.listdir(input_folder)
     if len(content) == 0:
+        logging_broadcast(f"input dir is empty")
         return config_files_locations
 
     files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
@@ -700,19 +708,33 @@ def find_config_files_locations(output_folder: str, input_folder: str, json_file
 
     for file_name in files:
         if file_name.upper().endswith("JSON"):
-            continue
-        lapse_id = file_name.split("_SPC")[0].split("timelapseID-")[1]
-        lapse_ids.add(lapse_id)
+            config_files_locations[file_name] = os.path.join(input_folder, file_name)
+        if file_name.upper().endswith(("BMP", "TIFF", "TIF")):
+            try:
+                lapse_id = file_name.split("_SPC")[0].split("timelapseID-")[1]
+                lapse_ids.add(lapse_id)
+            except IndexError:
+                logging_broadcast(f"file {file_name}, has incorrect naming, processing is skipped")
 
     for lapse_id in lapse_ids:
-        if os.path.exists(
-                os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}", f"AcquisitionMetadata_{lapse_id}.json")):
-            config_files_locations[lapse_id] = os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}",
-                                                            f"AcquisitionMetadata_{lapse_id}.json")
-        elif os.path.exists(os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}.json")):
-            config_files_locations[lapse_id] = os.path.join(output_folder, f"AcquisitionMetadata_{lapse_id}.json")
-        elif os.path.exists(os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")):
-            config_files_locations[lapse_id] = os.path.join(input_folder, f"AcquisitionMetadata_{lapse_id}.json")
+        if (os.path.exists(
+                os.path.join(output_folder,
+                             f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}",
+                             f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"))
+                and lapse_id not in config_files_locations):
+
+           config_files_locations[lapse_id] = os.path.join(output_folder,
+                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}",
+                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json")
+        elif os.path.exists(os.path.join(output_folder, f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"))\
+                and lapse_id not in config_files_locations:
+
+            config_files_locations[lapse_id] = os.path.join(output_folder,
+                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json")
+        elif os.path.exists(os.path.join(input_folder, f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"))\
+                and lapse_id not in config_files_locations:
+            config_files_locations[lapse_id] = os.path.join(input_folder,
+                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json")
         else:
             logging_broadcast(
                 f"Neither the output nor input directories contain the timelapse configuration file "
@@ -732,6 +754,7 @@ async def read_input_files(input_folder,
     global ACQUISITION_METADATA_FILE_TO_PROCESS
     try:
         awatch_input_folder = awatch(input_folder)
+        config_files = dict()
         while True:
             try:
                 if exit_gracefully.is_set():
@@ -741,9 +764,9 @@ async def read_input_files(input_folder,
                                                                input_folder,
                                                                ACQUISITION_METADATA_FILE_TO_PROCESS)
                     ACQUISITION_METADATA_FILE_TO_PROCESS = ""
-                else:
-                    config_files = find_config_files_locations(output_dir, input_folder)
-                if config_files:
+                # else:
+                #     config_files = find_config_files_locations(output_dir, input_folder)
+                if len(config_files) > 0:
                     for _, path in config_files.items():
                         try:
                             load_file_from_input_folder(path,
@@ -755,29 +778,30 @@ async def read_input_files(input_folder,
                                                         axes)
                         except Exception as e:
                             logging_broadcast(f"Error processing file {path}: {e}")
-                    config_files = None
+                    config_files = {}
                     files = []
                     for f in os.listdir(input_folder):
                         if not os.path.isfile(os.path.join(input_folder, f)):
                             continue
-                        if f.endswith(".json"):
+                        if f.upper().endswith(".JSON"):
                             continue
-                        files.append(os.path.join(input_folder, f))
-                    files.sort()
-                    for path in files:
-                        try:
-                            load_file_from_input_folder(path,
-                                                        output_dir,
-                                                        shared_queues_of_z_projections,
-                                                        json_config,
-                                                        manager,
-                                                        factor,
-                                                        axes)
-                        except Exception as e:
-                            logging_broadcast(f"Error processing file {path}: {e}")
+                        if f.upper().endswith((".TIF", ".TIFF", ".BMP")):
+                            files.append(os.path.join(input_folder, f))
+                            files.sort()
+                    if files:
+                        for path in files:
+                            try:
+                                load_file_from_input_folder(path,
+                                                            output_dir,
+                                                            shared_queues_of_z_projections,
+                                                            json_config,
+                                                            manager,
+                                                            factor,
+                                                            axes)
+                            except Exception as e:
+                                logging_broadcast(f"Error processing file {path}: {e}")
 
-
-                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
+                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=10.0)
                 paths = []
                 for change in changes:
                     event, file_path = change
@@ -801,12 +825,12 @@ async def read_input_files(input_folder,
                     break
             except StopAsyncIteration:
                 awatch_input_folder = awatch(input_folder)
-                continue
     except Exception as err:
         exit_gracefully.set()
-        logging_broadcast(err)
+        logging_broadcast(f"read_input_files {err}")
 
 
+# @profile
 def watchfiles_thread(*args):
     asyncio.run(read_input_files(*args))
     logging_broadcast("watchfiles finished")
@@ -832,8 +856,9 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     piv_processes = []
     manager = Manager()
     json_config = manager.dict()
-    shared_queues_of_z_projections = manager.dict()
-
+    shared_queues_of_z_projections = None
+    if PIVJLPATH:
+        shared_queues_of_z_projections = manager.dict()
     # Start the input directory observer
     logging_broadcast(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
     thread = Thread(target=watchfiles_thread, args=(input_dir,
@@ -857,7 +882,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
             while not SPECIMENS_QUANTITY_LOADED and not process_z_projections and not exit_gracefully.is_set():
                 time.sleep(1)
 
-            if specimen_quantity:
+            if specimen_quantity and shared_queues_of_z_projections is not None:
                 # update global variable to create plotting windows
                 SPECIMENS_QUANTITY = [i + 1 for i in range(0, specimen_quantity)]
                 for i in SPECIMENS_QUANTITY:
@@ -1000,7 +1025,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                                                  f"Specimen_{specimen_index}_avg_speed_"
                                                  f"{current_time.strftime('%H_%M_%S')}.png"))
                     except Exception as err:
-                        logging_broadcast(err)
+                        logging_broadcast(f"run_the_loop: {err}")
         if os.path.exists(stop_file) or process_z_projections or exit_gracefully.is_set():
             break
     thread.join()
