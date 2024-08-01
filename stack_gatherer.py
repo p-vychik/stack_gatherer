@@ -33,7 +33,6 @@ from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Manager, Event
-from memory_profiler import profile
 import zmq
 from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import QTimer
@@ -223,6 +222,28 @@ class ProjectionsDictWrapper:
     @property
     def stack_signature(self) -> StackSignature:
         return self.stack_signature_obj
+
+
+@dataclass
+class JsonConfigFile:
+    _processed: bool
+    _path: str
+    _lapse_id: str
+
+    def set_processed(self):
+        self._processed = True
+
+    @property
+    def path(self):
+        return self._path
+
+    @property
+    def is_processed(self):
+        return self._processed
+
+    @property
+    def get_lapse_id(self):
+        return self._lapse_id
 
 
 class ImageFile:
@@ -449,16 +470,17 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                     # clear dictionary to skip processing
                     projections.clear()
                     projections["Z"] = read_image(file_list[z])
-                    zyx_stack.flush()
+                    # zyx_stack.flush()
                     pbar.update(1)
                     break
-                zyx_stack.flush()
+                # zyx_stack.flush()
                 pbar.update(1)
                 continue
             zyx_stack[z] = read_image(file_list[z])
             projections = plane_to_projection(zyx_stack[z], projections)
-            zyx_stack.flush()
+            # zyx_stack.flush()
             pbar.update(1)
+        zyx_stack.flush()
     if projections:
         # correct anisotropy for X and Y projections by resizing the array with user specified factor
         if "Y" in projections:
@@ -557,8 +579,8 @@ def load_lapse_parameters_json(file_path: str,
         logging_broadcast(f"{file_path} permission error, check if file is already opened")
         return False
     except Exception as e:
-        logging_broadcast(
-            f"{file_path} failed to parse JSON", e)
+        logging_broadcast(f"{file_path} failed to parse JSON {e}")
+        return False
 
     if lapse_parameters:
         timestamp = os.path.basename(file_path).strip(".json").split("_")[1]
@@ -584,7 +606,14 @@ def load_lapse_parameters_json(file_path: str,
     return False
 
 
-def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, manager, factor=1, axes=""):
+def load_file_from_input_folder(config_files,
+                                file_path,
+                                output_dir,
+                                shared_dict,
+                                json_dict,
+                                manager,
+                                factor=1,
+                                axes=""):
     global SPECIMENS_QUANTITY
     global SPECIMENS_QUANTITY_LOADED
     global PLOTTING_WINDOW_CREATED
@@ -592,7 +621,24 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
     if os.path.isdir(file_path):
         return
     # load json parameters
-    if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.lower().endswith(".json"):
+    if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
+        lapse_id = get_lapse_id(file_path)
+        logging_broadcast(f"try to parse {file_path} with {lapse_id}")
+        if lapse_id:
+            if lapse_id in config_files:
+                logging_broadcast(f"try to check {lapse_id} in dictionary")
+                if config_files[lapse_id].is_processed:
+                    return
+            else:
+                logging_broadcast(f"try to set {lapse_id} for jsonconfigfile")
+                config_files[lapse_id] = JsonConfigFile(False,
+                                                        file_path,
+                                                        lapse_id
+                                                        )
+        else:
+            logging_broadcast(f"Can't parse JSON file time-lapse ID")
+            return
+
         destination_folder = os.path.join(output_dir, os.path.basename(file_path).strip(".json"))
         setup_acquisition_log(destination_folder)
         logging_broadcast(f"new logger is set, prepare to parse JSON {file_path}")
@@ -601,26 +647,27 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
             logging_broadcast(f"{file_path} parsing as JSON file failed")
             return
         list_of_stack_signatures, metadata_json = json_parsing_result
-        logging_broadcast("update json dict ")
-        new_keys = [key for key in list_of_stack_signatures if key not in json_dict]
-        if new_keys:
-            json_dict.update(dict.fromkeys(new_keys, metadata_json))
+        # new_keys = [key for key in list_of_stack_signatures if key not in json_dict]
+        # if new_keys:
+        logging_broadcast(f"update lapse config from {file_path}")
+        json_dict.update(dict.fromkeys(list_of_stack_signatures, metadata_json))
         # get specimens quantity
         try:
             SPECIMENS_QUANTITY = [specimen_dict['userDefinedIndex'] for specimen_dict in metadata_json['specimens']]
             SPECIMENS_QUANTITY_LOADED = True
         except Exception as err:
-            logging_broadcast(f"load_file_from_input_folder {err}")
+            logging_broadcast(f"Failed to set specimen quantity {err}")
         if len(SPECIMENS_QUANTITY) and shared_dict is not None:
             shared_dict.clear()
             for i in SPECIMENS_QUANTITY:
                 shared_dict[i] = manager.Queue()
         PLOTTING_WINDOW_CREATED = False
+        config_files[lapse_id].set_processed()
         try:
             if not os.path.exists(os.path.join(destination_folder, os.path.basename(file_path))):
                 shutil.move(file_path, destination_folder)
-        except Exception as error:
-            logging_broadcast(f"load_file_from_input_folder {error}")
+        except Exception as err:
+            logging_broadcast(f"load_file_from_input_folder {err}")
     if file_path.upper().endswith((".TIFF", ".BMP", ".TIF")):
         # Call the function when a new file is created
         try:
@@ -629,8 +676,8 @@ def load_file_from_input_folder(file_path, output_dir, shared_dict, json_dict, m
             # image file is incorrect, move it to the temp_dir
             try:
                 shutil.move(file_path, TEMP_DIR)
-            except OSError:
-                pass
+            except Exception as err:
+                logging_broadcast(f"Moving {file_path} to {TEMP_DIR} resulted in {err}")
             return
         stack_signature = add_file_to_active_stacks(file)
         # create separate folder for the output based on metadata filename
@@ -662,7 +709,24 @@ def update_napari_viewer_layer():
                     VIEWER.layers[axes_names].reset_contrast_limits()
 
 
-def find_config_files_locations(output_folder: str, input_folder: str, json_file_name=None) -> dict:
+def get_lapse_id(file_name):
+    try:
+        base_name = os.path.basename(file_name)
+        if base_name.upper().endswith('.JSON'):
+            return base_name.split('_')[1].strip('.json')
+        elif base_name.upper().endswith(('.BMP', '.TIFF', '.TIF')):
+            return base_name.split("_SPC")[0].split("timelapseID-")[1]
+        else:
+            logging_broadcast(f"get_lapse_id failed to parse {file_name} for timelapseID")
+    except IndexError:
+        logging_broadcast(f"IndexError: get_lapse_id failed to parse {file_name} for timelapseID")
+        return False
+
+
+def find_config_files_locations(config_files_locations: dict,
+                                output_folder: str,
+                                input_folder: str,
+                                json_file_name=None):
     """
     Returns the locations of time-lapse metadata files in JSON format based on corresponding timestamped names
     of image planes from the batch for all files in the output_folder and input_folder.
@@ -679,68 +743,67 @@ def find_config_files_locations(output_folder: str, input_folder: str, json_file
     - dict: A dictionary mapping lapse IDs to the full paths of the JSON files found.
             If json_file_name is provided, returns a dictionary with a single entry.
     """
-    config_files_locations = {}
-    def collect_jsons(json_file_name):
 
-        if os.path.exists(os.path.join(output_folder, json_file_name)):
-            config_files_locations[json_file_name] = os.path.join(output_folder, json_file_name)
-        elif os.path.exists(os.path.join(output_folder, os.path.splitext(json_file_name)[0], json_file_name)):
-            config_files_locations[json_file_name] = os.path.join(output_folder,
-                                                                  os.path.splitext(json_file_name)[0],
-                                                                  json_file_name)
-        elif os.path.exists(os.path.join(input_folder, json_file_name)):
-            config_files_locations[json_file_name] = os.path.join(input_folder, json_file_name)
-        return config_files_locations
+    def collect_jsons(file_name):
 
+        base_name = os.path.splitext(os.path.basename(file_name))[0]
+        lapse_id = get_lapse_id(file_name)
+        if not file_name.endswith('.json'):
+            # we deal with image file and should construct the expected JSON file name based on name pattern
+            base_name = f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}"
+            file_name = f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"
+
+        logging_broadcast(f"start collecting jsons")
+        if lapse_id:
+            if os.path.exists(os.path.join(output_folder, file_name)):
+                config_files_locations[lapse_id] = JsonConfigFile(False,
+                                                                  os.path.join(output_folder, file_name),
+                                                                  lapse_id
+                                                                  )
+                logging_broadcast(f"found {config_files_locations[lapse_id].path}")
+            elif base_name and os.path.exists(os.path.join(output_folder, base_name, file_name)):
+                config_files_locations[lapse_id] = JsonConfigFile(False,
+                                                                  os.path.join(output_folder, base_name, file_name),
+                                                                  lapse_id
+                                                                  )
+                logging_broadcast(f"found {config_files_locations[lapse_id].path}")
+            elif os.path.exists(os.path.join(input_folder, file_name)):
+                config_files_locations[lapse_id] = JsonConfigFile(False,
+                                                                  os.path.join(input_folder, file_name),
+                                                                  lapse_id
+                                                                  )
+                logging_broadcast(f"found {config_files_locations[lapse_id].path}")
+            else:
+                logging_broadcast(f"checked all location unsuccessfully: {os.path.join(output_folder, file_name)} "
+                                  f"{os.path.join(output_folder, base_name, file_name)} "
+                                  f"{os.path.join(input_folder, file_name)}")
 
     # If json_file_name is provided, directly check its presence
     if json_file_name:
         collect_jsons(json_file_name)
+        return
 
-    # If json_file_name is not provided, continue with lapse ID-based search
+    # If json_file_name is not provided, collect lapse ID from planes present in the folder and continue
+    # with search in input and output folders
     content = os.listdir(input_folder)
     if len(content) == 0:
-        logging_broadcast(f"input dir is empty")
-        return config_files_locations
+        logging_broadcast(f"input directory doesn't contain images of config files")
+        return
 
-    files = [f for f in content if os.path.isfile(os.path.join(input_folder, f))]
     lapse_ids = set()
+    file_paths_with_unique_lapse_ids = []
 
-    for file_name in files:
-        if file_name.upper().endswith("JSON"):
-            config_files_locations[file_name] = os.path.join(input_folder, file_name)
-        if file_name.upper().endswith(("BMP", "TIFF", "TIF")):
-            try:
-                lapse_id = file_name.split("_SPC")[0].split("timelapseID-")[1]
-                lapse_ids.add(lapse_id)
-            except IndexError:
-                logging_broadcast(f"file {file_name}, has incorrect naming, processing is skipped")
+    for file_name in content:
+        lapse_id = get_lapse_id(file_name)
+        if lapse_id:
+            if lapse_id in lapse_ids:
+                continue
+            lapse_ids.add(lapse_id)
+            file_paths_with_unique_lapse_ids.append(file_name)
 
-    for lapse_id in lapse_ids:
-        if (os.path.exists(
-                os.path.join(output_folder,
-                             f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}",
-                             f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"))
-                and lapse_id not in config_files_locations):
-
-           config_files_locations[lapse_id] = os.path.join(output_folder,
-                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}",
-                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json")
-        elif os.path.exists(os.path.join(output_folder, f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"))\
-                and lapse_id not in config_files_locations:
-
-            config_files_locations[lapse_id] = os.path.join(output_folder,
-                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json")
-        elif os.path.exists(os.path.join(input_folder, f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"))\
-                and lapse_id not in config_files_locations:
-            config_files_locations[lapse_id] = os.path.join(input_folder,
-                                                            f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json")
-        else:
-            logging_broadcast(
-                f"Neither the output nor input directories contain the timelapse configuration file "
-                f"for lapse id {lapse_id}. Processing of planes won't be initiated.")
-
-    return config_files_locations
+    if file_paths_with_unique_lapse_ids:
+        for file_name in file_paths_with_unique_lapse_ids:
+            collect_jsons(file_name)
 
 
 async def read_input_files(input_folder,
@@ -755,21 +818,24 @@ async def read_input_files(input_folder,
     try:
         awatch_input_folder = awatch(input_folder)
         config_files = dict()
-        while True:
+        # we want to check every 6 mins starting from initial run
+        next_check_for_unprocessed_planes = time.time() - 360
+        while not exit_gracefully.is_set():
             try:
-                if exit_gracefully.is_set():
-                    break
                 if ACQUISITION_METADATA_FILE_TO_PROCESS:
-                    config_files = find_config_files_locations(output_dir,
-                                                               input_folder,
-                                                               ACQUISITION_METADATA_FILE_TO_PROCESS)
+                    find_config_files_locations(config_files,
+                                                output_dir,
+                                                input_folder,
+                                                ACQUISITION_METADATA_FILE_TO_PROCESS)
                     ACQUISITION_METADATA_FILE_TO_PROCESS = ""
-                # else:
-                #     config_files = find_config_files_locations(output_dir, input_folder)
-                if len(config_files) > 0:
-                    for _, path in config_files.items():
+                    logging_broadcast(f"content of config_files {config_files}")
+                    json_files = [f.path for _, f in config_files.items() if not f.is_processed]
+                    dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
+                    json_files.extend(dir_content)
+                    for file_path in json_files:
                         try:
-                            load_file_from_input_folder(path,
+                            load_file_from_input_folder(config_files,
+                                                        file_path,
                                                         output_dir,
                                                         shared_queues_of_z_projections,
                                                         json_config,
@@ -777,31 +843,31 @@ async def read_input_files(input_folder,
                                                         factor,
                                                         axes)
                         except Exception as e:
-                            logging_broadcast(f"Error processing file {path}: {e}")
-                    config_files = {}
-                    files = []
-                    for f in os.listdir(input_folder):
-                        if not os.path.isfile(os.path.join(input_folder, f)):
-                            continue
-                        if f.upper().endswith(".JSON"):
-                            continue
-                        if f.upper().endswith((".TIF", ".TIFF", ".BMP")):
-                            files.append(os.path.join(input_folder, f))
-                            files.sort()
-                    if files:
-                        for path in files:
-                            try:
-                                load_file_from_input_folder(path,
-                                                            output_dir,
-                                                            shared_queues_of_z_projections,
-                                                            json_config,
-                                                            manager,
-                                                            factor,
-                                                            axes)
-                            except Exception as e:
-                                logging_broadcast(f"Error processing file {path}: {e}")
+                            logging_broadcast(f"Error processing file {file_path}: {e}")
+                elif time.time() - next_check_for_unprocessed_planes > 360:
+                    next_check_for_unprocessed_planes = time.time() + 360
+                    find_config_files_locations(config_files,
+                                                output_dir,
+                                                input_folder
+                                                )
+                    logging_broadcast(f"content of config_files {config_files}")
+                    json_files = [f.path for _, f in config_files.items() if not f.is_processed]
+                    dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
+                    json_files.extend(dir_content)
+                    for file_path in json_files:
+                        try:
+                            load_file_from_input_folder(config_files,
+                                                        file_path,
+                                                        output_dir,
+                                                        shared_queues_of_z_projections,
+                                                        json_config,
+                                                        manager,
+                                                        factor,
+                                                        axes)
+                        except Exception as e:
+                            logging_broadcast(f"Error processing file {file_path}: {e}")
 
-                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=10.0)
+                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
                 paths = []
                 for change in changes:
                     event, file_path = change
@@ -811,7 +877,8 @@ async def read_input_files(input_folder,
                     paths.sort()
                     for path in paths:
                         try:
-                            load_file_from_input_folder(path,
+                            load_file_from_input_folder(config_files,
+                                                        path,
                                                         output_dir,
                                                         shared_queues_of_z_projections,
                                                         json_config,
@@ -830,7 +897,6 @@ async def read_input_files(input_folder,
         logging_broadcast(f"read_input_files {err}")
 
 
-# @profile
 def watchfiles_thread(*args):
     asyncio.run(read_input_files(*args))
     logging_broadcast("watchfiles finished")
@@ -1331,6 +1397,7 @@ def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
                     last_heartbeat_recieved = time.time()
 
             if time.time() - last_heartbeat_recieved > HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec:
+                logging_broadcast(f"Heartbeat from microscope missed, restart")
                 exit_gracefully.set()
 
             current_time = time.time()
@@ -1465,6 +1532,7 @@ def main():
         logging_broadcast(f"{args},\n {e}")
     thread = Thread(target=run_the_loop, args=(vars(args), exit_gracefully))
     thread.start()
+    logging_broadcast(f"18:28 mod")
     VIEWER = make_napari_viewer()
     timer1 = QTimer()
     timer1.timeout.connect(update_avg_speed_plot_windows)
