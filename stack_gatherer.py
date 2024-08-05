@@ -25,12 +25,14 @@ from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
 from PIL import Image
 import asyncio
+import cv2
 from watchfiles import awatch
 from threading import Thread
 from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
 from datetime import datetime
 from multiprocessing import Manager, Event
 import zmq
@@ -61,8 +63,8 @@ SPECIMENS_QUANTITY = []
 PLOTTING_WINDOW_CREATED = False
 plotting_windows_timer = QTimer()
 active_stacks = {}
-currenty_saving_stacks_locks = {}
-currenty_saving_stacks_dict_lock = threading.Lock()
+currently_saving_stacks_locks = {}
+currently_saving_stacks_dict_lock = threading.Lock()
 HEARTBEAT_INTERVAL_SEC = 5
 command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
@@ -223,6 +225,14 @@ class ProjectionsDictWrapper:
     def stack_signature(self) -> StackSignature:
         return self.stack_signature_obj
 
+    @property
+    def specimen(self) -> int:
+        return self.stack_signature_obj.specimen
+
+    @property
+    def time_point(self) -> int:
+        return self.stack_signature_obj.time_point
+
 
 @dataclass
 class JsonConfigFile:
@@ -244,6 +254,13 @@ class JsonConfigFile:
     @property
     def get_lapse_id(self):
         return self._lapse_id
+
+
+@dataclass
+class PivTimeSeries:
+    x: List[float] = field(default_factory=list)
+    y: List[float] = field(default_factory=list)
+    t: int = 0
 
 
 class ImageFile:
@@ -391,6 +408,40 @@ def file_name_merged_illumination_based_on_signature(stack_signature):
             f"Z_MAX_projection")
 
 
+def fix_image_drift(ref_img, img):
+    # ORB detector
+    orb = cv2.ORB_create()
+
+    # detect keypoints and descriptors in images
+    kp_ref, des_ref = orb.detectAndCompute(ref_img, None)
+    kp_img, des_img = orb.detectAndCompute(img, None)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des_img, des_ref)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    # extract matches
+    points_ref = np.zeros((len(matches), 2), dtype=np.float32)
+    points_img = np.zeros((len(matches), 2), dtype=np.float32)
+
+    for i, match in enumerate(matches):
+        points_ref[i, :] = kp_ref[match.trainIdx].pt
+        points_img[i, :] = kp_img[match.queryIdx].pt
+
+    # find homography
+    try:
+        h, mask = cv2.findHomography(points_img, points_ref, cv2.RANSAC)
+    except Exception as err:
+        # error here usually results due to inability of cv2 to find enough features for correction
+        logging_broadcast(f"cv2.findHomography was unsuccessful, shift correction skipped {err}")
+        return img
+
+    # use homography to warp image
+    height, width = ref_img.shape
+    aligned_img = cv2.warpPerspective(img, h, (width, height))
+
+    return aligned_img
+
+
 def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
     """
     Function gets as an input a plane as a numpy array and a dictionary that keys define the projections to be made.
@@ -470,15 +521,13 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
                     # clear dictionary to skip processing
                     projections.clear()
                     projections["Z"] = read_image(file_list[z])
-                    # zyx_stack.flush()
                     pbar.update(1)
                     break
-                # zyx_stack.flush()
                 pbar.update(1)
                 continue
             zyx_stack[z] = read_image(file_list[z])
             projections = plane_to_projection(zyx_stack[z], projections)
-            # zyx_stack.flush()
+            # projections = plane_to_projection(zyx_stack[z], projections)
             pbar.update(1)
         zyx_stack.flush()
     if projections:
@@ -541,9 +590,9 @@ def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir
     if len(active_stacks[stack_signature.signature]) < stack_signature.total_num_planes:
         return
     # We have to ensure that two events firing at the same time don't start saving the same stack twice
-    with currenty_saving_stacks_dict_lock:
-        if stack_signature not in currenty_saving_stacks_locks:
-            currenty_saving_stacks_locks[stack_signature.signature] = True
+    with currently_saving_stacks_dict_lock:
+        if stack_signature not in currently_saving_stacks_locks:
+            currently_saving_stacks_locks[stack_signature.signature] = True
         else:
             return
     file_list = []
@@ -566,7 +615,7 @@ def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir
     if images_dict:
         LAYERS_INPUT.put(images_dict)
     del active_stacks[stack_signature.signature]
-    del currenty_saving_stacks_locks[stack_signature.signature]
+    del currently_saving_stacks_locks[stack_signature.signature]
 
 
 def load_lapse_parameters_json(file_path: str,
@@ -698,6 +747,15 @@ def update_napari_viewer_layer():
     if LAYERS_INPUT.qsize() > 0:
         data_input = LAYERS_INPUT.get()
         for axes_names, image in data_input.items():
+            match = re.search(r'TP_(\d+)', axes_names)
+            if match:
+                current_tp = int(match.group(1))
+                previous_tp = current_tp - 1
+                previous_axes_names = re.sub(r'TP_\d+', f'TP_{previous_tp}', axes_names)
+                # Check if the previous layer exists and delete it if it does
+                if previous_axes_names in VIEWER.layers:
+                    del VIEWER.layers[previous_axes_names]
+
             if axes_names not in VIEWER.layers:
                 VIEWER.add_image(image, name=axes_names)
             else:
@@ -720,7 +778,7 @@ def get_lapse_id(file_name):
             logging_broadcast(f"get_lapse_id failed to parse {file_name} for timelapseID")
     except IndexError:
         logging_broadcast(f"IndexError: get_lapse_id failed to parse {file_name} for timelapseID")
-        return False
+        return ""
 
 
 def find_config_files_locations(config_files_locations: dict,
@@ -749,7 +807,7 @@ def find_config_files_locations(config_files_locations: dict,
         base_name = os.path.splitext(os.path.basename(file_name))[0]
         lapse_id = get_lapse_id(file_name)
         if not file_name.endswith('.json'):
-            # we deal with image file and should construct the expected JSON file name based on name pattern
+            # we deal with image file and should construct the JSON file name based on pattern
             base_name = f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}"
             file_name = f"{ACQUISITION_META_FILE_PATTERN}{lapse_id}.json"
 
@@ -787,7 +845,7 @@ def find_config_files_locations(config_files_locations: dict,
     # with search in input and output folders
     content = os.listdir(input_folder)
     if len(content) == 0:
-        logging_broadcast(f"input directory doesn't contain images of config files")
+        logging_broadcast(f"input directory doesn't contain images or config files")
         return
 
     lapse_ids = set()
@@ -818,7 +876,7 @@ async def read_input_files(input_folder,
     try:
         awatch_input_folder = awatch(input_folder)
         config_files = dict()
-        # we want to check every 6 mins starting from initial run
+        # check input folder  regularly starting from initial run
         next_check_for_unprocessed_planes = time.time() - 360
         while not exit_gracefully.is_set():
             try:
@@ -828,7 +886,6 @@ async def read_input_files(input_folder,
                                                 input_folder,
                                                 ACQUISITION_METADATA_FILE_TO_PROCESS)
                     ACQUISITION_METADATA_FILE_TO_PROCESS = ""
-                    logging_broadcast(f"content of config_files {config_files}")
                     json_files = [f.path for _, f in config_files.items() if not f.is_processed]
                     dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
                     json_files.extend(dir_content)
@@ -919,7 +976,6 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     process_z_projections = kwargs.get("process_z_projections", False)
     token, chat_id = "", ""
 
-    piv_processes = []
     manager = Manager()
     json_config = manager.dict()
     shared_queues_of_z_projections = None
@@ -964,24 +1020,18 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                         token, chat_id = line.strip().split(" ")
                     except Exception as err:
                         logging_broadcast(err)
-
-            for i, _ in shared_queues_of_z_projections.items():
-                piv_process = PivProcess(
-                    target=run_piv_process, args=(shared_queues_of_z_projections,
-                                                  PIV_OUTPUT,
-                                                  avg_speed_data,
-                                                  stop_process,
-                                                  PIVJLPATH,
-                                                  migration_detected,
-                                                  i,
-                                                  process_z_projections,
-                                                  output_dir
-                                                  ),
-                    name='piv_run',
-                )
-                piv_processes.append(piv_process)
-                piv_process.start()
-
+            piv_process = PivProcess(
+                target=run_piv_process, args=(shared_queues_of_z_projections,
+                                              PIV_OUTPUT,
+                                              avg_speed_data,
+                                              stop_process,
+                                              PIVJLPATH,
+                                              migration_detected,
+                                              process_z_projections,
+                                              output_dir
+                                              ),
+                name='piv_run', )
+            piv_process.start()
             # mode to process only max projections
             if process_z_projections:
                 logging_broadcast(f"Considering directory as Z projections source: {input_dir}, calculate"
@@ -1041,14 +1091,10 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
             # Gracefully stop the observer if the script is interrupted
             stop_process.set()
 
-        # terminate running quickPIV processes
-        if piv_processes:
-            for process in piv_processes:
-                process.terminate()
-                time.sleep(0.1)
-                process.join()
-            time.sleep(0.5)
-            piv_processes = []
+        if PIVJLPATH:
+            # terminate running quickPIV processes
+            if piv_process.is_alive():
+               piv_process.terminate()
 
         # save PIV data to csv
         if avg_speed_data:
@@ -1194,7 +1240,8 @@ def get_projections_dict_from_queue():
                 for wrapped_dict in projections_dict_list:
                     channel_layer = draw_napari_layer(wrapped_dict.projections)
                     for key, val in channel_layer.items():
-                        image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                        image_layer_dict[(f"SPC_{wrapped_dict.specimen}_TP_{wrapped_dict.time_point}_{key}"
+                                          f"_ILL_{wrapped_dict.illumination}")] = val
                 DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
         else:
             if projections_dict_list:
@@ -1203,7 +1250,8 @@ def get_projections_dict_from_queue():
                 for wrapped_dict in projections_dict_list:
                     channel_layer = draw_napari_layer(wrapped_dict.projections)
                     for key, val in channel_layer.items():
-                        image_layer_dict[f"{key}_ILL_{wrapped_dict.illumination}"] = val
+                        image_layer_dict[(f"SPC_{wrapped_dict.specimen}_TP_{wrapped_dict.time_point}_{key}"
+                                          f"_ILL_{wrapped_dict.illumination}")] = val
                 DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
             else:
                 logging_broadcast("Empty projections dictionary")
@@ -1231,94 +1279,105 @@ def run_piv_process(shared_dict_queue: dict,
                     stop_process: Event,
                     piv_path: str,
                     migration_detected: multiprocessing.Queue,
-                    queue_number: int,
                     save_merged_illumination: bool,
                     output_dir: str
                     ):
+
     from juliacall import Main as jl
     jl.include(piv_path)
-    piv_projection_queue = Queue()
-    projections_to_process = Queue()
+    piv_projection_queue, projections_to_process, ts_dict = dict(), dict(), dict()
+    for queue_number, _ in shared_dict_queue.items():
+        piv_projection_queue[queue_number] = Queue()
+        projections_to_process[queue_number] = Queue()
+        ts_dict[queue_number] = PivTimeSeries(x=[], y=[], t=0)
     migration_event_frame = set()
-    queue_in = shared_dict_queue[queue_number]
     logging_broadcast(f"quickPIV process started, PID: {os.getpid()}")
-    t = 0
-    x = []
-    y = []
-    while not stop_process.is_set():
-        plane_matrix = queue_in.get()
-        if plane_matrix:
-            projections_to_process.put(plane_matrix)
-        if projections_to_process.qsize() >= 2:
-            wrapped_z_p_1 = projections_to_process.get()
-            # to calculate avg speed in consecutive way we store
-            # the last projection from every pairwise comparison
-            wrapped_z_p_2 = projections_to_process.queue[0]
-            if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
-                merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
-                                                                 (wrapped_z_p_1,
-                                                                  wrapped_z_p_2))
-                                                                )
-                merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
-                                                             wrapped_z_p_2.signature)
-                if save_merged_illumination:
-                    try:
-                        file_name = file_name_merged_illumination_based_on_signature(wrapped_z_p_2.stack_signature)
-                        imwrite(os.path.join(output_dir, f"{file_name}.tif"), merged_wrapped_proj.projections["Z"])
-                    except Exception as err:
-                        migration_detected.put(f"Failed to save the merged Z-projection, {err}")
-                piv_projection_queue.put(merged_wrapped_proj)
-                projections_to_process.get()
-            else:
-                piv_projection_queue.put(wrapped_z_p_1)
 
-            if piv_projection_queue.qsize() < 2:
+    while not stop_process.is_set():
+        for queue_number, queue_in in shared_dict_queue.items():
+            try:
+                plane_matrix = shared_dict_queue[queue_number].get(timeout=1)
+            except Exception as err:
                 continue
-            m_1 = piv_projection_queue.get().projections["Z"]
-            # to compare projections in a consecutive way,
-            # we have to leave the last projection in the piv_projection_queue
-            m_2 = piv_projection_queue.queue[0].projections["Z"]
-            if m_1.shape == m_2.shape:
-                try:
-                    avg_speed = jl.fn(m_1, m_2)
-                    avg_speed = round(avg_speed[-1], 3)
-                except Exception as error:
-                    raise error
-                # current_time = now.strftime("%H:%M:%S")
-                t += 1
-                x.append(t)
-                avg_speed_data.append({"time_point": t, "specimen": queue_number + 1, "avg_speed": avg_speed})
-                try:
-                    y.append(avg_speed)
-                except Exception as error:
-                    raise error
-                if len(x) > PLT_WIDGET_X_AXIS_LENGTH:
-                    x = x[-PLT_WIDGET_X_AXIS_LENGTH::]
-                    y = y[-PLT_WIDGET_X_AXIS_LENGTH::]
-                try:
-                    peaks, _ = find_peaks(np.asarray(y), prominence=1.5)
-                except Exception as error:
-                    raise error
-                x_marker, y_marker = [], []
-                if len(peaks):
+            if plane_matrix:
+                projections_to_process[queue_number].put(plane_matrix)
+            if projections_to_process[queue_number].qsize() >= 2:
+                wrapped_z_p_1 = projections_to_process[queue_number].get()
+                # to calculate avg speed in consecutive way we store
+                # the last projection from every pairwise comparison
+                wrapped_z_p_2 = projections_to_process[queue_number].queue[0]
+                if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
+                    merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
+                                                                     (wrapped_z_p_1,
+                                                                      wrapped_z_p_2))
+                                                                    )
+                    merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
+                                                                 wrapped_z_p_2.signature)
+                    if save_merged_illumination:
+                        try:
+                            file_name = file_name_merged_illumination_based_on_signature(wrapped_z_p_2.stack_signature)
+                            imwrite(os.path.join(output_dir, f"{file_name}.tif"), merged_wrapped_proj.projections["Z"])
+                        except Exception as err:
+                            migration_detected.put(f"Failed to save the merged Z-projection, {err}")
+                    piv_projection_queue[queue_number].put(merged_wrapped_proj)
+                    projections_to_process[queue_number].get()
+                else:
+                    piv_projection_queue[queue_number].put(wrapped_z_p_1)
+
+                if piv_projection_queue[queue_number].qsize() < 2:
+                    continue
+                m_1 = piv_projection_queue[queue_number].get().projections["Z"]
+                # to compare projections in a consecutive way,
+                # we have to leave the last projection in the piv_projection_queue
+                m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
+                # correct planes drift:
+                aligned_m2 = fix_image_drift(m_1, m_2)
+                piv_projection_queue[queue_number].queue[0].projections["Z"] = aligned_m2
+                if m_1.shape == aligned_m2.shape:
                     try:
-                        peaks = peaks.tolist()
-                        x_marker = [x[i] for i in peaks]
-                        y_marker = [y[i] for i in peaks]
-                        if len(x) > PLT_WIDGET_X_AXIS_LENGTH:
-                            global_peaks_indices = [x + t - PLT_WIDGET_X_AXIS_LENGTH + 1 for x in x_marker]
-                        else:
-                            global_peaks_indices = x_marker
-                        for frame in global_peaks_indices:
-                            if frame not in migration_event_frame:
-                                migration_event_frame.add(frame)
-                                migration_detected.put(f"{frame}, specimen {queue_number + 1}")
+                        start_piv = time.time()
+                        avg_speed = jl.fn(m_1, aligned_m2)
+                        logging_broadcast(f"piv run took {time.time()-start_piv}")
+                        avg_speed = round(avg_speed[-1], 3)
                     except Exception as error:
                         raise error
-                queue_out.put((queue_number, x, y, x_marker, y_marker))
-            else:
-                raise ValueError("Projections should have the same size for QuickPIV input")
-
+                    ts_dict[queue_number].t += 1
+                    ts_dict[queue_number].x.append(ts_dict[queue_number].t)
+                    avg_speed_data.append({"time_point": ts_dict[queue_number].t,
+                                           "specimen": queue_number + 1,
+                                           "avg_speed": avg_speed})
+                    try:
+                        ts_dict[queue_number].y.append(avg_speed)
+                    except Exception as error:
+                        logging_broadcast(f"failed to update time-series list: {error}")
+                    if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
+                        ts_dict[queue_number].x = ts_dict[queue_number].x[-PLT_WIDGET_X_AXIS_LENGTH::]
+                        ts_dict[queue_number].y = ts_dict[queue_number].y[-PLT_WIDGET_X_AXIS_LENGTH::]
+                    try:
+                        peaks, _ = find_peaks(np.asarray(ts_dict[queue_number].y), prominence=1.5)
+                    except Exception as error:
+                        raise error
+                    x_marker, y_marker = [], []
+                    if len(peaks):
+                        try:
+                            peaks = peaks.tolist()
+                            x_marker = [ts_dict[queue_number].x[i] for i in peaks]
+                            y_marker = [ts_dict[queue_number].y[i] for i in peaks]
+                            if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
+                                global_peaks_indices = [x + ts_dict[queue_number].t - PLT_WIDGET_X_AXIS_LENGTH
+                                                        + 1 for x in x_marker]
+                            else:
+                                global_peaks_indices = x_marker
+                            for frame in global_peaks_indices:
+                                if frame not in migration_event_frame:
+                                    migration_event_frame.add(frame)
+                                    migration_detected.put(f"{frame}, specimen {queue_number + 1}")
+                        except Exception as error:
+                            raise error
+                    queue_out.put((queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
+                else:
+                    raise ValueError("Projections should have the same size for QuickPIV input")
+        time.sleep(1)
 
 def update_avg_speed_plot_windows():
     global PIV_OUTPUT
@@ -1478,7 +1537,7 @@ def main():
                         default=None,
                         help="Directory path to store input images with incorrect file name")
     parser.add_argument('--pivjl', required=True if '-process_z_projections' in sys.argv else False,
-                        default=False,
+                        default=None,
                         help="Path to auxiliary julia script for average migration speed calculation with quickPIV")
     parser.add_argument('--bot_config', required=False, default=False,
                         help="Path to text file with token and chat_id information (one line, space separator) for"
@@ -1532,7 +1591,6 @@ def main():
         logging_broadcast(f"{args},\n {e}")
     thread = Thread(target=run_the_loop, args=(vars(args), exit_gracefully))
     thread.start()
-    logging_broadcast(f"18:28 mod")
     VIEWER = make_napari_viewer()
     timer1 = QTimer()
     timer1.timeout.connect(update_avg_speed_plot_windows)
