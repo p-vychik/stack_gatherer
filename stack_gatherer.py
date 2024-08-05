@@ -375,14 +375,14 @@ class ImageFile:
 
 
 def read_image(image_path):
-    if image_path.endswith((".tif", ".tiff")):
+    if image_path.upper().endswith((".TIF", ".TIFF")):
         time.sleep(0.1)
         try:
             image = imread(image_path)
             return image
         except Exception as error:
             logging_broadcast(f"read_image {error}")
-    if image_path.endswith(".bmp"):
+    if image_path.upper().endswith(".BMP"):
         try:
             image = Image.open(image_path)
             if image.mode == "RGB":
@@ -964,6 +964,8 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
     global SPECIMENS_QUANTITY
+    global PROJECTIONS_QUEUE
+    global LAYERS_INPUT
 
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
@@ -972,7 +974,6 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     TEMP_DIR = kwargs.get("temp_dir", None)
     PIVJLPATH = kwargs.get("pivjl", None)
     bot_config_path = kwargs.get("bot_config", "")
-    specimen_quantity = kwargs.get("specimen_quantity", 0)
     process_z_projections = kwargs.get("process_z_projections", False)
     token, chat_id = "", ""
 
@@ -993,7 +994,8 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                                                     exit_gracefully),
                     daemon=False
                     )
-    thread.start()
+    if not process_z_projections:
+        thread.start()
 
     while True:
         migration_detected = manager.Queue()
@@ -1003,12 +1005,18 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
         if PIVJLPATH:
             while not SPECIMENS_QUANTITY_LOADED and not process_z_projections and not exit_gracefully.is_set():
                 time.sleep(1)
-
-            if specimen_quantity and shared_queues_of_z_projections is not None:
-                # update global variable to create plotting windows
-                SPECIMENS_QUANTITY = [i + 1 for i in range(0, specimen_quantity)]
-                for i in SPECIMENS_QUANTITY:
-                    shared_queues_of_z_projections[i] = manager.Queue()
+            if process_z_projections:
+                specimen_indices = set()
+                for f in os.listdir(input_dir):
+                    if not f.upper().endswith((".TIF", ".BMP")):
+                        continue
+                    match = re.search(r"(?<=SPC-)\d+", f)
+                    if match:
+                        specimen_indices.add(int(match.group()))
+                if specimen_indices:
+                    SPECIMENS_QUANTITY.extend(sorted(specimen_indices))
+                    for index in specimen_indices:
+                        shared_queues_of_z_projections[index] = manager.Queue()
 
             if len(SPECIMENS_QUANTITY):
                 SPECIMENS_QUANTITY_LOADED = False
@@ -1041,24 +1049,36 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                 for projection in z_projections:
                     file_path = os.path.join(input_dir, projection)
                     img_data = read_image(file_path)
+                    if isinstance(img_data, bool):
+                        continue
                     img_metadata = ImageFile(file_path)
-                    if not isinstance(img_data, bool) and not isinstance(img_metadata, bool):
+                    if not isinstance(img_metadata, bool):
                         stack_signature = img_metadata.get_stack_signature()
                         wrapped_z_projection = ProjectionsDictWrapper({"Z": img_data}, stack_signature)
                         # push projection to the queue for PIV calculations
                         if stack_signature.specimen in shared_queues_of_z_projections:
                             while True:
-                                if shared_queues_of_z_projections[stack_signature.specimen].qsize() > 50:
+                                if shared_queues_of_z_projections[stack_signature.specimen].qsize() > 10:
                                     time.sleep(1)
                                 else:
                                     break
+                            if wrapped_z_projection.signature not in PROJECTIONS_QUEUE:
+                                PROJECTIONS_QUEUE[wrapped_z_projection.identifier] = [wrapped_z_projection]
+                            else:
+                                PROJECTIONS_QUEUE[wrapped_z_projection.identifier].append(wrapped_z_projection)
+                            images_dict = get_projections_dict_from_queue()
+                            if images_dict:
+                                LAYERS_INPUT.put(images_dict)
                             shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
+                        else:
+                            logging_broadcast(f"Specimen index {stack_signature.specimen} was not found, check "
+                                              f"if file name format follows the expected name pattern")
                 logging_broadcast(f"Finished with uploading projection files for quickPIV")
 
         try:
             stop_file = os.path.join(input_dir, STOP_FILE_NAME)
-            counter = 0
-            speed_list_len = []
+            check_next = time.time() + 60
+            speed_list_length = len(avg_speed_data)
             while not os.path.exists(stop_file) and not SPECIMENS_QUANTITY_LOADED and not exit_gracefully.is_set():
                 if migration_detected.qsize() > 0:
                     migration_event = migration_detected.get()
@@ -1074,15 +1094,13 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                 if process_z_projections:
                     # counter is used to check the list size approximately every minute
                     # if the avg_speed_data doesn't change - save the data and finish the pipeline
-                    counter += 1
-                    if counter % 30 == 0:
-                        speed_list_len.append(len(avg_speed_data))
-                        if len(speed_list_len) > 2:
-                            speed_list_len.pop(0)
-                            if speed_list_len[-1] == speed_list_len[-2]:
-                                logging_broadcast(f"No changes in quickPIV output queue, "
-                                                  f"stop pipeline and save the data")
-                                break
+                    if check_next - time.time() <= 0:
+                        if speed_list_length == len(avg_speed_data):
+                            logging_broadcast(f"No changes in quickPIV output queue, "
+                                              f"stop pipeline and save the data")
+                            break
+                        check_next = time.time() + 60
+                        speed_list_length = len(avg_speed_data)
                 # Sleep to keep the script running
                 time.sleep(1)
             if PIVJLPATH:
@@ -1140,7 +1158,8 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                         logging_broadcast(f"run_the_loop: {err}")
         if os.path.exists(stop_file) or process_z_projections or exit_gracefully.is_set():
             break
-    thread.join()
+    if thread.is_alive():
+        thread.join()
 
 
 def draw_napari_layer(projections_dict):
@@ -1344,7 +1363,7 @@ def run_piv_process(shared_dict_queue: dict,
                     ts_dict[queue_number].t += 1
                     ts_dict[queue_number].x.append(ts_dict[queue_number].t)
                     avg_speed_data.append({"time_point": ts_dict[queue_number].t,
-                                           "specimen": queue_number + 1,
+                                           "specimen": queue_number,
                                            "avg_speed": avg_speed})
                     try:
                         ts_dict[queue_number].y.append(avg_speed)
@@ -1371,13 +1390,14 @@ def run_piv_process(shared_dict_queue: dict,
                             for frame in global_peaks_indices:
                                 if frame not in migration_event_frame:
                                     migration_event_frame.add(frame)
-                                    migration_detected.put(f"{frame}, specimen {queue_number + 1}")
+                                    migration_detected.put(f"{frame}, specimen {queue_number}")
                         except Exception as error:
                             raise error
                     queue_out.put((queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
                 else:
                     raise ValueError("Projections should have the same size for QuickPIV input")
         time.sleep(1)
+
 
 def update_avg_speed_plot_windows():
     global PIV_OUTPUT
@@ -1406,10 +1426,11 @@ def update_plotting_windows(exit_gracefully: threading.Event):
         if len(PLT_WIDGETS_DICT) > 0:
             # delete window from previous lapse
             PLT_WIDGETS_DICT = {}
-        for i in SPECIMENS_QUANTITY:
-            PLT_WIDGETS_DICT[i] = PlottingWindow(i)
-            PLT_WIDGETS_DICT[i].show()
-        PLOTTING_WINDOW_CREATED = True
+        if len(SPECIMENS_QUANTITY):
+            for i in SPECIMENS_QUANTITY:
+                PLT_WIDGETS_DICT[i] = PlottingWindow(i)
+                PLT_WIDGETS_DICT[i].show()
+            PLOTTING_WINDOW_CREATED = True
 
 
 def parse_message_from_microscope(message, exit_gracefully: threading.Event):
@@ -1527,12 +1548,6 @@ def main():
     parser.add_argument('-f', '--factor_anisotropy', type=int,
                         required=True if '--axes' in sys.argv else False,
                         help="Value is used for correcting projection's anisotropic distortions")
-    # Specimen quantity
-    parser.add_argument('--specimen_quantity', type=int,
-                        required=True if '-process_z_projections' in sys.argv else False,
-                        help="Value for number of specimens in the stage, defines number of plotting windows "
-                             "if json config is not available")
-    # Move image files with incorrect name to the user provided directory
     parser.add_argument('--temp_dir', required=False,
                         default=None,
                         help="Directory path to store input images with incorrect file name")
