@@ -111,7 +111,6 @@ def logging_broadcast(string: str):
         CURRENT_ACQUISITION_LOGGER.info(string)
     else:
         logging.getLogger('main_logger').info(string)
-    # logging.info(string)
 
 
 class PlottingWindow(QMainWindow, Ui_MainWindow):
@@ -657,8 +656,7 @@ def load_lapse_parameters_json(file_path: str,
     return False
 
 
-def load_file_from_input_folder(config_files,
-                                file_path,
+def load_file_from_input_folder(file_path,
                                 output_dir,
                                 shared_dict,
                                 json_dict,
@@ -673,23 +671,7 @@ def load_file_from_input_folder(config_files,
         return
     # load json parameters
     if os.path.basename(file_path).startswith(ACQUISITION_META_FILE_PATTERN) and file_path.endswith(".json"):
-        lapse_id = get_lapse_id(file_path)
-        logging_broadcast(f"try to parse {file_path} with {lapse_id}")
-        if lapse_id:
-            if lapse_id in config_files:
-                logging_broadcast(f"try to check {lapse_id} in dictionary")
-                if config_files[lapse_id].is_processed:
-                    return
-            else:
-                logging_broadcast(f"try to set {lapse_id} for jsonconfigfile")
-                config_files[lapse_id] = JsonConfigFile(False,
-                                                        file_path,
-                                                        lapse_id
-                                                        )
-        else:
-            logging_broadcast(f"Can't parse JSON file time-lapse ID")
-            return
-
+        logging_broadcast(f"try to parse {file_path}")
         destination_folder = os.path.join(output_dir, os.path.basename(file_path).strip(".json"))
         setup_acquisition_log(destination_folder)
         logging_broadcast(f"new logger is set, prepare to parse JSON {file_path}")
@@ -698,8 +680,6 @@ def load_file_from_input_folder(config_files,
             logging_broadcast(f"{file_path} parsing as JSON file failed")
             return
         list_of_stack_signatures, metadata_json = json_parsing_result
-        # new_keys = [key for key in list_of_stack_signatures if key not in json_dict]
-        # if new_keys:
         logging_broadcast(f"update lapse config from {file_path}")
         json_dict.update(dict.fromkeys(list_of_stack_signatures, metadata_json))
         # get specimens quantity
@@ -714,7 +694,7 @@ def load_file_from_input_folder(config_files,
                     shared_dict[i] = manager.Queue()
                 logging_broadcast(f"quickPIV queue was updated")
         PLOTTING_WINDOW_CREATED = False
-        config_files[lapse_id].set_processed()
+
         try:
             if not os.path.exists(os.path.join(destination_folder, os.path.basename(file_path))):
                 try:
@@ -892,98 +872,25 @@ async def read_input_files(input_folder,
 
 
     try:
-        awatch_input_folder = awatch(input_folder)
-        config_files = dict()
-        files_to_load = []
-        seen_files = set()
-
-        if ACQUISITION_METADATA_FILE_TO_PROCESS:
-            find_config_files_locations(config_files, output_dir, input_folder, ACQUISITION_METADATA_FILE_TO_PROCESS)
-
-            json_files = [f for f in config_files.values() if not f.is_processed]
-            dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
-
-            # Avoid duplicates
-            for f in json_files:
-                if f.path not in seen_files:
-                    files_to_load.append(f.path)
-                    seen_files.add(f.path)
-
-            for f in dir_content:
-                if f not in seen_files:
-                    files_to_load.append(f)
-                    seen_files.add(f)
-
-            for file_path in files_to_load:
-                try:
-                    load_file_from_input_folder(config_files, file_path, output_dir, shared_queues_of_z_projections,
-                                                json_config, manager, factor, axes)
-                    # Mark JSON config file as processed
-                    json_config_file = config_files.get(os.path.basename(file_path))
-                    if json_config_file:
-                        json_config_file.set_processed()
-                except Exception as e:
-                    logging_broadcast(f"Error processing file {file_path}: {e}")
-
-        # Check input folder regularly starting from initial run
-        next_check_for_unprocessed_planes = time.time() - 10
-        while not exit_gracefully.is_set():
-            try:
-                if time.time() - next_check_for_unprocessed_planes > 10:
-                    files_to_load = []
-                    next_check_for_unprocessed_planes = time.time() + 10
-                    find_config_files_locations(config_files, output_dir, input_folder)
-                    logging_broadcast(f"content of config_files {config_files}")
-
-                    json_files = [f for f in config_files.values() if not f.is_processed]
-                    dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
-
-                    # Avoid duplicates
-                    for f in json_files:
-                        if f.path not in seen_files:
-                            files_to_load.append(f.path)
-                            seen_files.add(f.path)
-
-                    for f in dir_content:
-                        if f not in seen_files:
-                            files_to_load.append(f)
-                            seen_files.add(f)
-                    if len(files_to_load):
-                        for file_path in files_to_load:
-                            try:
-                                load_file_from_input_folder(config_files, file_path, output_dir,
-                                                            shared_queues_of_z_projections,
-                                                            json_config, manager, factor, axes)
-                                # Mark JSON config file as processed
-                                json_config_file = config_files.get(os.path.basename(file_path))
-                                if json_config_file:
-                                    json_config_file.set_processed()
-                            except Exception as e:
-                                logging_broadcast(f"Error processing file {file_path}: {e}")
-
-                changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
-                paths = [file_path for event, file_path in changes if event.value == 1]
-
-                if paths:
-                    paths.sort()
-                    for path in paths:
-                        if path not in seen_files:
-                            try:
-                                load_file_from_input_folder(config_files, path, output_dir,
-                                                            shared_queues_of_z_projections,
-                                                            json_config, manager, factor, axes)
-                                # Mark JSON config file as processed
-                                json_config_file = config_files.get(os.path.basename(path))
-                                if json_config_file:
-                                    json_config_file.set_processed()
-                                seen_files.add(path)
-                            except Exception as e:
-                                logging_broadcast(f"Error processing file {path}: {e}")
-            except asyncio.TimeoutError:
-                if exit_gracefully.is_set():
-                    break
-            except StopAsyncIteration:
-                awatch_input_folder = awatch(input_folder)
+        async for changes in awatch(input_folder):
+            paths = []
+            for change in changes:
+                event, file_path = change
+                if event.value == 1:
+                    paths.append(file_path)
+            if paths:
+                paths.sort()
+                for path in paths:
+                    try:
+                        load_file_from_input_folder(path,
+                                                    output_dir,
+                                                    shared_queues_of_z_projections,
+                                                    json_config,
+                                                    manager,
+                                                    factor,
+                                                    axes)
+                    except Exception as err:
+                        logging_broadcast(f"Error processing file {path}: {err}")
     except Exception as err:
         exit_gracefully.set()
         logging_broadcast(f"read_input_files {err}")
