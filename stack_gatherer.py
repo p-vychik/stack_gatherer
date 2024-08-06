@@ -40,6 +40,12 @@ from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QMainWindow
 from scipy.signal import find_peaks
+# drift correction import
+from dexp.processing.registration.model.translation_registration_model import TranslationRegistrationModel
+from dexp.processing.registration.translation_nd import register_translation_nd
+from dexp.utils import xpArray
+from dexp.utils.backends import Backend
+from scipy.ndimage import shift as scipy_shift
 
 CURRENT_ACQUISITION_LOGGER = None
 STOP_FILE_NAME = "STOP_STACK_GATHERING"
@@ -408,40 +414,6 @@ def file_name_merged_illumination_based_on_signature(stack_signature):
             f"ILL-MERGED_CAM-{stack_signature.camera}_"
             f"CH-{stack_signature.channel}_"
             f"Z_MAX_projection")
-
-
-def fix_image_drift(ref_img, img):
-    # ORB detector
-    orb = cv2.ORB_create()
-
-    # detect keypoints and descriptors in images
-    kp_ref, des_ref = orb.detectAndCompute(ref_img, None)
-    kp_img, des_img = orb.detectAndCompute(img, None)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des_img, des_ref)
-    matches = sorted(matches, key=lambda x: x.distance)
-
-    # extract matches
-    points_ref = np.zeros((len(matches), 2), dtype=np.float32)
-    points_img = np.zeros((len(matches), 2), dtype=np.float32)
-
-    for i, match in enumerate(matches):
-        points_ref[i, :] = kp_ref[match.trainIdx].pt
-        points_img[i, :] = kp_img[match.queryIdx].pt
-
-    # find homography
-    try:
-        h, mask = cv2.findHomography(points_img, points_ref, cv2.RANSAC)
-    except Exception as err:
-        # error here usually results due to inability of cv2 to find enough features for correction
-        logging_broadcast(f"cv2.findHomography was unsuccessful, shift correction skipped {err}")
-        return img
-
-    # use homography to warp image
-    height, width = ref_img.shape
-    aligned_img = cv2.warpPerspective(img, h, (width, height))
-
-    return aligned_img
 
 
 def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
@@ -1301,16 +1273,22 @@ def run_piv_process(shared_dict_queue: dict,
                     # we have to leave the last projection in the piv_projection_queue
                     m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
                     # correct planes drift:
+                    margin = 100
+                    m_1_copy = m_1.copy()
+                    m_2_copy = m_2.copy()
                     try:
-                        aligned_m2 = fix_image_drift(m_1, m_2)
+                        translation_model = register_translation_nd(m_1, m_2)
+                        m_1 = m_1[margin:-margin, margin:-margin]
+                        corrected_m_2 = scipy_shift(m_2, translation_model.shift_vector)
+                        m_2 = corrected_m_2[margin:-margin, margin:-margin]
                     except Exception as err:
                         logging_broadcast(f"drift correction wasn't successfull, {err}")
-                        aligned_m2 = m_2
-                    piv_projection_queue[queue_number].queue[0].projections["Z"] = aligned_m2
-                    if m_1.shape == aligned_m2.shape:
+                        m_1 = m_1_copy
+                        m_2 = m_2_copy
+                    if m_1.shape == m_2.shape:
                         try:
                             start_piv = time.time()
-                            avg_speed = jl.fn(m_1, aligned_m2)
+                            avg_speed = jl.fn(m_1, m_2)
                             logging_broadcast(f"piv run took {time.time() - start_piv}")
                             if isinstance(avg_speed[-1], float) or isinstance(avg_speed[-1], int):
                                 avg_speed = round(avg_speed[-1], 3)
