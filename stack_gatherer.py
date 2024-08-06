@@ -127,18 +127,21 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
         self.close()
 
     def plot_curve(self, x, y, x_marker, y_marker):
-        # Plot a curve:
-        self.plotWidget.canvas.axes.clear()
-        y_lim_range = (math.floor(min(y) * 0.9), math.ceil(max(y) * 1.1))
-        self.plotWidget.canvas.axes.set_ylim(y_lim_range)
-        self.plotWidget.canvas.axes.plot(x, y, color='blue')
-        if x_marker and y_marker:
-            self.plotWidget.canvas.axes.plot(x_marker, y_marker,
-                                             color='red', marker='o',
-                                             markersize=12, linewidth=0)
-        self.plotWidget.canvas.axes.set_xticks(x)
-        self.plotWidget.canvas.axes.set_xticklabels(x, fontsize=10)
-        self.plotWidget.canvas.draw()
+        try:
+            # Plot a curve:
+            self.plotWidget.canvas.axes.clear()
+            y_lim_range = (math.floor(min(y) * 0.9), math.ceil(max(y) * 1.1))
+            self.plotWidget.canvas.axes.set_ylim(y_lim_range)
+            self.plotWidget.canvas.axes.plot(x, y, color='blue')
+            if x_marker and y_marker:
+                self.plotWidget.canvas.axes.plot(x_marker, y_marker,
+                                                 color='red', marker='o',
+                                                 markersize=12, linewidth=0)
+            self.plotWidget.canvas.axes.set_xticks(x)
+            self.plotWidget.canvas.axes.set_xticklabels(x, fontsize=10)
+            self.plotWidget.canvas.draw()
+        except Exception as err:
+            logging_broadcast(f"plot_curve exception: {err}")
 
 
 class PivProcess(multiprocessing.Process):
@@ -1257,7 +1260,7 @@ def run_piv_process(shared_dict_queue: dict,
         writer = csv.writer(file)
         if file.tell() == 0:
             writer.writerow(['time_point', 'specimen', 'avg_speed'])
-        while not stop_process.is_set():
+        while True:
             for queue_number, queue_in in shared_dict_queue.items():
                 logging_broadcast(f"piv heartbeat")
                 try:
@@ -1298,14 +1301,23 @@ def run_piv_process(shared_dict_queue: dict,
                     # we have to leave the last projection in the piv_projection_queue
                     m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
                     # correct planes drift:
-                    aligned_m2 = fix_image_drift(m_1, m_2)
+                    try:
+                        aligned_m2 = fix_image_drift(m_1, m_2)
+                    except Exception as err:
+                        logging_broadcast(f"drift correction wasn't successfull, {err}")
+                        aligned_m2 = m_2
                     piv_projection_queue[queue_number].queue[0].projections["Z"] = aligned_m2
                     if m_1.shape == aligned_m2.shape:
                         try:
                             start_piv = time.time()
                             avg_speed = jl.fn(m_1, aligned_m2)
                             logging_broadcast(f"piv run took {time.time() - start_piv}")
-                            avg_speed = round(avg_speed[-1], 3)
+                            if isinstance(avg_speed[-1], float) or isinstance(avg_speed[-1], int):
+                                avg_speed = round(avg_speed[-1], 3)
+                            else:
+                                logging_broadcast(f"quickPIV returned abnormal value {avg_speed[-1]} "
+                                                  f"for specimen #{queue_number}, "
+                                                  f"frame #{ts_dict[queue_number].t + 1}")
                         except Exception as error:
                             raise error
                         ts_dict[queue_number].t += 1
@@ -1344,6 +1356,7 @@ def run_piv_process(shared_dict_queue: dict,
                                 raise error
                         queue_out.put(
                             (queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
+                        logging_broadcast(f"plane from queue #{queue_number} was processed")
                     else:
                         raise ValueError("Projections should have the same size for QuickPIV input")
             time.sleep(0.1)
@@ -1562,7 +1575,7 @@ def main():
     timer1.start(25)
     timer2 = QTimer()
     timer2.timeout.connect(update_napari_viewer_layer)
-    timer2.start(50)
+    timer2.start(10)
     plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(exit_gracefully))
     plotting_windows_timer.start(1000)
     timer4 = QTimer()
