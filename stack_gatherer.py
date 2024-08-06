@@ -550,7 +550,7 @@ def collect_files_to_one_stack_get_axial_projections(stack_signature: StackSigna
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
             # here we should put the projection with clear identification of species and other parameters
             if shared_dict is not None:
-                if stack_signature.specimen:
+                if stack_signature.specimen in shared_dict:
                     shared_dict[stack_signature.specimen].put(wrapped_z_projection)
                 else:
                     logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
@@ -583,7 +583,9 @@ def add_file_to_active_stacks(image_file: ImageFile):
         logging_broadcast(f"Adding stack {stack_signature.signature} to active queue.")
     if image_file.plane not in active_stacks[stack_signature.signature]:
         active_stacks[stack_signature.signature][image_file.plane] = image_file
-    return stack_signature
+        return stack_signature
+    else:
+        return False
 
 
 def check_stack_and_collect_if_ready(stack_signature: StackSignature, output_dir, shared_dict, axes=None, factor=None):
@@ -707,14 +709,26 @@ def load_file_from_input_folder(config_files,
         except Exception as err:
             logging_broadcast(f"Failed to set specimen quantity {err}")
         if len(SPECIMENS_QUANTITY) and shared_dict is not None:
-            shared_dict.clear()
-            for i in SPECIMENS_QUANTITY:
-                shared_dict[i] = manager.Queue()
+            if len(shared_dict) == 0:
+                for i in SPECIMENS_QUANTITY:
+                    shared_dict[i] = manager.Queue()
+                logging_broadcast(f"quickPIV queue was updated")
         PLOTTING_WINDOW_CREATED = False
         config_files[lapse_id].set_processed()
         try:
             if not os.path.exists(os.path.join(destination_folder, os.path.basename(file_path))):
-                shutil.move(file_path, destination_folder)
+                try:
+                    shutil.move(file_path, destination_folder)
+                except Exception as err:
+                    logging_broadcast(f"Attempt to move {file_path} reulted in {err}")
+            else:
+                logging_broadcast(f"file {os.path.basename(file_path)} exists in"
+                                  f"  {os.path.join(destination_folder, os.path.basename(file_path))}, "
+                                  f"so it would be removed")
+                try:
+                    os.remove(file_path)
+                except Exception as err:
+                    logging_broadcast(f"{err}")
         except Exception as err:
             logging_broadcast(f"load_file_from_input_folder {err}")
     if file_path.upper().endswith((".TIFF", ".BMP", ".TIF")):
@@ -731,15 +745,18 @@ def load_file_from_input_folder(config_files,
         stack_signature = add_file_to_active_stacks(file)
         # create separate folder for the output based on metadata filename
         try:
-            output_dir = json_dict[stack_signature.signature_no_time]["output_folder"]
-            if os.path.exists(output_dir):
-                check_stack_and_collect_if_ready(stack_signature,
-                                                 output_dir,
-                                                 shared_dict,
-                                                 axes,
-                                                 factor)
-        except KeyError:
-            logging_broadcast("No lapse configuration for the plane, check if AcquisitionMeta file is loaded")
+            if not isinstance(stack_signature, bool):
+                output_dir = json_dict[stack_signature.signature_no_time]["output_folder"]
+                if os.path.exists(output_dir):
+                    check_stack_and_collect_if_ready(stack_signature,
+                                                     output_dir,
+                                                     shared_dict,
+                                                     axes,
+                                                     factor)
+            else:
+                return
+        except Exception as err:
+            logging_broadcast(f"load_file_from_input_folder was unsuccessful, {err}")
 
 
 def update_napari_viewer_layer():
@@ -872,78 +889,96 @@ async def read_input_files(input_folder,
                            factor,
                            axes,
                            exit_gracefully: threading.Event):
-    global ACQUISITION_METADATA_FILE_TO_PROCESS
+
+
     try:
         awatch_input_folder = awatch(input_folder)
         config_files = dict()
-        # check input folder  regularly starting from initial run
-        next_check_for_unprocessed_planes = time.time() - 360
+        files_to_load = []
+        seen_files = set()
+
+        if ACQUISITION_METADATA_FILE_TO_PROCESS:
+            find_config_files_locations(config_files, output_dir, input_folder, ACQUISITION_METADATA_FILE_TO_PROCESS)
+
+            json_files = [f for f in config_files.values() if not f.is_processed]
+            dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
+
+            # Avoid duplicates
+            for f in json_files:
+                if f.path not in seen_files:
+                    files_to_load.append(f.path)
+                    seen_files.add(f.path)
+
+            for f in dir_content:
+                if f not in seen_files:
+                    files_to_load.append(f)
+                    seen_files.add(f)
+
+            for file_path in files_to_load:
+                try:
+                    load_file_from_input_folder(config_files, file_path, output_dir, shared_queues_of_z_projections,
+                                                json_config, manager, factor, axes)
+                    # Mark JSON config file as processed
+                    json_config_file = config_files.get(os.path.basename(file_path))
+                    if json_config_file:
+                        json_config_file.set_processed()
+                except Exception as e:
+                    logging_broadcast(f"Error processing file {file_path}: {e}")
+
+        # Check input folder regularly starting from initial run
+        next_check_for_unprocessed_planes = time.time() - 10
         while not exit_gracefully.is_set():
             try:
-                if ACQUISITION_METADATA_FILE_TO_PROCESS:
-                    find_config_files_locations(config_files,
-                                                output_dir,
-                                                input_folder,
-                                                ACQUISITION_METADATA_FILE_TO_PROCESS)
-                    ACQUISITION_METADATA_FILE_TO_PROCESS = ""
-                    json_files = [f.path for _, f in config_files.items() if not f.is_processed]
-                    dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
-                    json_files.extend(dir_content)
-                    for file_path in json_files:
-                        try:
-                            load_file_from_input_folder(config_files,
-                                                        file_path,
-                                                        output_dir,
-                                                        shared_queues_of_z_projections,
-                                                        json_config,
-                                                        manager,
-                                                        factor,
-                                                        axes)
-                        except Exception as e:
-                            logging_broadcast(f"Error processing file {file_path}: {e}")
-                elif time.time() - next_check_for_unprocessed_planes > 360:
-                    next_check_for_unprocessed_planes = time.time() + 360
-                    find_config_files_locations(config_files,
-                                                output_dir,
-                                                input_folder
-                                                )
+                if time.time() - next_check_for_unprocessed_planes > 10:
+                    files_to_load = []
+                    next_check_for_unprocessed_planes = time.time() + 10
+                    find_config_files_locations(config_files, output_dir, input_folder)
                     logging_broadcast(f"content of config_files {config_files}")
-                    json_files = [f.path for _, f in config_files.items() if not f.is_processed]
+
+                    json_files = [f for f in config_files.values() if not f.is_processed]
                     dir_content = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
-                    json_files.extend(dir_content)
-                    for file_path in json_files:
-                        try:
-                            load_file_from_input_folder(config_files,
-                                                        file_path,
-                                                        output_dir,
-                                                        shared_queues_of_z_projections,
-                                                        json_config,
-                                                        manager,
-                                                        factor,
-                                                        axes)
-                        except Exception as e:
-                            logging_broadcast(f"Error processing file {file_path}: {e}")
+
+                    # Avoid duplicates
+                    for f in json_files:
+                        if f.path not in seen_files:
+                            files_to_load.append(f.path)
+                            seen_files.add(f.path)
+
+                    for f in dir_content:
+                        if f not in seen_files:
+                            files_to_load.append(f)
+                            seen_files.add(f)
+                    if len(files_to_load):
+                        for file_path in files_to_load:
+                            try:
+                                load_file_from_input_folder(config_files, file_path, output_dir,
+                                                            shared_queues_of_z_projections,
+                                                            json_config, manager, factor, axes)
+                                # Mark JSON config file as processed
+                                json_config_file = config_files.get(os.path.basename(file_path))
+                                if json_config_file:
+                                    json_config_file.set_processed()
+                            except Exception as e:
+                                logging_broadcast(f"Error processing file {file_path}: {e}")
 
                 changes = await asyncio.wait_for(awatch_input_folder.__anext__(), timeout=5.0)
-                paths = []
-                for change in changes:
-                    event, file_path = change
-                    if event.value == 1:  # Assuming '1' means 'file created' or similar
-                        paths.append(file_path)
+                paths = [file_path for event, file_path in changes if event.value == 1]
+
                 if paths:
                     paths.sort()
                     for path in paths:
-                        try:
-                            load_file_from_input_folder(config_files,
-                                                        path,
-                                                        output_dir,
-                                                        shared_queues_of_z_projections,
-                                                        json_config,
-                                                        manager,
-                                                        factor,
-                                                        axes)
-                        except Exception as e:
-                            logging_broadcast(f"Error processing file {path}: {e}")
+                        if path not in seen_files:
+                            try:
+                                load_file_from_input_folder(config_files, path, output_dir,
+                                                            shared_queues_of_z_projections,
+                                                            json_config, manager, factor, axes)
+                                # Mark JSON config file as processed
+                                json_config_file = config_files.get(os.path.basename(path))
+                                if json_config_file:
+                                    json_config_file.set_processed()
+                                seen_files.add(path)
+                            except Exception as e:
+                                logging_broadcast(f"Error processing file {path}: {e}")
             except asyncio.TimeoutError:
                 if exit_gracefully.is_set():
                     break
@@ -1112,7 +1147,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
         if PIVJLPATH:
             # terminate running quickPIV processes
             if piv_process.is_alive():
-               piv_process.terminate()
+                piv_process.terminate()
 
         # save PIV data to csv
         if avg_speed_data:
@@ -1301,7 +1336,6 @@ def run_piv_process(shared_dict_queue: dict,
                     save_merged_illumination: bool,
                     output_dir: str
                     ):
-
     from juliacall import Main as jl
     jl.include(piv_path)
     piv_projection_queue, projections_to_process, ts_dict = dict(), dict(), dict()
@@ -1311,92 +1345,101 @@ def run_piv_process(shared_dict_queue: dict,
         ts_dict[queue_number] = PivTimeSeries(x=[], y=[], t=0)
     migration_event_frame = set()
     logging_broadcast(f"quickPIV process started, PID: {os.getpid()}")
-
-    while not stop_process.is_set():
-        for queue_number, queue_in in shared_dict_queue.items():
-            try:
-                plane_matrix = shared_dict_queue[queue_number].get(timeout=1)
-            except Exception as err:
-                continue
-            if plane_matrix:
-                projections_to_process[queue_number].put(plane_matrix)
-            if projections_to_process[queue_number].qsize() >= 2:
-                wrapped_z_p_1 = projections_to_process[queue_number].get()
-                # to calculate avg speed in consecutive way we store
-                # the last projection from every pairwise comparison
-                wrapped_z_p_2 = projections_to_process[queue_number].queue[0]
-                if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
-                    merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
-                                                                     (wrapped_z_p_1,
-                                                                      wrapped_z_p_2))
-                                                                    )
-                    merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
-                                                                 wrapped_z_p_2.signature)
-                    if save_merged_illumination:
-                        try:
-                            file_name = file_name_merged_illumination_based_on_signature(wrapped_z_p_2.stack_signature)
-                            imwrite(os.path.join(output_dir, f"{file_name}.tif"), merged_wrapped_proj.projections["Z"])
-                        except Exception as err:
-                            migration_detected.put(f"Failed to save the merged Z-projection, {err}")
-                    piv_projection_queue[queue_number].put(merged_wrapped_proj)
-                    projections_to_process[queue_number].get()
-                else:
-                    piv_projection_queue[queue_number].put(wrapped_z_p_1)
-
-                if piv_projection_queue[queue_number].qsize() < 2:
+    csv_file = os.path.join(output_dir, f"piv_avg_speed_{datetime.now().strftime('%H_%M_%S')}.csv")
+    with open(csv_file, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        if file.tell() == 0:
+            writer.writerow(['time_point', 'specimen', 'avg_speed'])
+        while not stop_process.is_set():
+            for queue_number, queue_in in shared_dict_queue.items():
+                logging_broadcast(f"piv heartbeat")
+                try:
+                    plane_matrix = shared_dict_queue[queue_number].get(timeout=1)
+                except Exception as err:
                     continue
-                m_1 = piv_projection_queue[queue_number].get().projections["Z"]
-                # to compare projections in a consecutive way,
-                # we have to leave the last projection in the piv_projection_queue
-                m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
-                # correct planes drift:
-                aligned_m2 = fix_image_drift(m_1, m_2)
-                piv_projection_queue[queue_number].queue[0].projections["Z"] = aligned_m2
-                if m_1.shape == aligned_m2.shape:
-                    try:
-                        start_piv = time.time()
-                        avg_speed = jl.fn(m_1, aligned_m2)
-                        logging_broadcast(f"piv run took {time.time()-start_piv}")
-                        avg_speed = round(avg_speed[-1], 3)
-                    except Exception as error:
-                        raise error
-                    ts_dict[queue_number].t += 1
-                    ts_dict[queue_number].x.append(ts_dict[queue_number].t)
-                    avg_speed_data.append({"time_point": ts_dict[queue_number].t,
-                                           "specimen": queue_number,
-                                           "avg_speed": avg_speed})
-                    try:
-                        ts_dict[queue_number].y.append(avg_speed)
-                    except Exception as error:
-                        logging_broadcast(f"failed to update time-series list: {error}")
-                    if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
-                        ts_dict[queue_number].x = ts_dict[queue_number].x[-PLT_WIDGET_X_AXIS_LENGTH::]
-                        ts_dict[queue_number].y = ts_dict[queue_number].y[-PLT_WIDGET_X_AXIS_LENGTH::]
-                    try:
-                        peaks, _ = find_peaks(np.asarray(ts_dict[queue_number].y), prominence=1.5)
-                    except Exception as error:
-                        raise error
-                    x_marker, y_marker = [], []
-                    if len(peaks):
+                if plane_matrix:
+                    projections_to_process[queue_number].put(plane_matrix)
+                if projections_to_process[queue_number].qsize() >= 2:
+                    wrapped_z_p_1 = projections_to_process[queue_number].get()
+                    # to calculate avg speed in consecutive way we store
+                    # the last projection from every pairwise comparison
+                    wrapped_z_p_2 = projections_to_process[queue_number].queue[0]
+                    if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
+                        merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
+                                                                         (wrapped_z_p_1,
+                                                                          wrapped_z_p_2))
+                                                                        )
+                        merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
+                                                                     wrapped_z_p_2.signature)
+                        if save_merged_illumination:
+                            try:
+                                file_name = file_name_merged_illumination_based_on_signature(
+                                    wrapped_z_p_2.stack_signature)
+                                imwrite(os.path.join(output_dir, f"{file_name}.tif"),
+                                        merged_wrapped_proj.projections["Z"])
+                            except Exception as err:
+                                migration_detected.put(f"Failed to save the merged Z-projection, {err}")
+                        piv_projection_queue[queue_number].put(merged_wrapped_proj)
+                        projections_to_process[queue_number].get()
+                    else:
+                        piv_projection_queue[queue_number].put(wrapped_z_p_1)
+
+                    if piv_projection_queue[queue_number].qsize() < 2:
+                        continue
+                    m_1 = piv_projection_queue[queue_number].get().projections["Z"]
+                    # to compare projections in a consecutive way,
+                    # we have to leave the last projection in the piv_projection_queue
+                    m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
+                    # correct planes drift:
+                    aligned_m2 = fix_image_drift(m_1, m_2)
+                    piv_projection_queue[queue_number].queue[0].projections["Z"] = aligned_m2
+                    if m_1.shape == aligned_m2.shape:
                         try:
-                            peaks = peaks.tolist()
-                            x_marker = [ts_dict[queue_number].x[i] for i in peaks]
-                            y_marker = [ts_dict[queue_number].y[i] for i in peaks]
-                            if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
-                                global_peaks_indices = [x + ts_dict[queue_number].t - PLT_WIDGET_X_AXIS_LENGTH
-                                                        + 1 for x in x_marker]
-                            else:
-                                global_peaks_indices = x_marker
-                            for frame in global_peaks_indices:
-                                if frame not in migration_event_frame:
-                                    migration_event_frame.add(frame)
-                                    migration_detected.put(f"{frame}, specimen {queue_number}")
+                            start_piv = time.time()
+                            avg_speed = jl.fn(m_1, aligned_m2)
+                            logging_broadcast(f"piv run took {time.time() - start_piv}")
+                            avg_speed = round(avg_speed[-1], 3)
                         except Exception as error:
                             raise error
-                    queue_out.put((queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
-                else:
-                    raise ValueError("Projections should have the same size for QuickPIV input")
-        time.sleep(1)
+                        ts_dict[queue_number].t += 1
+                        ts_dict[queue_number].x.append(ts_dict[queue_number].t)
+                        writer.writerow([ts_dict[queue_number].t,
+                                         queue_number,
+                                         avg_speed])
+                        file.flush()
+                        try:
+                            ts_dict[queue_number].y.append(avg_speed)
+                        except Exception as error:
+                            logging_broadcast(f"failed to update time-series list: {error}")
+                        if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
+                            ts_dict[queue_number].x = ts_dict[queue_number].x[-PLT_WIDGET_X_AXIS_LENGTH::]
+                            ts_dict[queue_number].y = ts_dict[queue_number].y[-PLT_WIDGET_X_AXIS_LENGTH::]
+                        try:
+                            peaks, _ = find_peaks(np.asarray(ts_dict[queue_number].y), prominence=1.5)
+                        except Exception as error:
+                            raise error
+                        x_marker, y_marker = [], []
+                        if len(peaks):
+                            try:
+                                peaks = peaks.tolist()
+                                x_marker = [ts_dict[queue_number].x[i] for i in peaks]
+                                y_marker = [ts_dict[queue_number].y[i] for i in peaks]
+                                if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
+                                    global_peaks_indices = [x + ts_dict[queue_number].t - PLT_WIDGET_X_AXIS_LENGTH
+                                                            + 1 for x in x_marker]
+                                else:
+                                    global_peaks_indices = x_marker
+                                for frame in global_peaks_indices:
+                                    if frame not in migration_event_frame:
+                                        migration_event_frame.add(frame)
+                                        migration_detected.put(f"{frame}, specimen {queue_number}")
+                            except Exception as error:
+                                raise error
+                        queue_out.put(
+                            (queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
+                    else:
+                        raise ValueError("Projections should have the same size for QuickPIV input")
+            time.sleep(0.1)
 
 
 def update_avg_speed_plot_windows():
@@ -1597,7 +1640,7 @@ def main():
     # debugpy.listen(('0.0.0.0', 5680))
     # logging_broadcast("Waiting for debugger attach")
     # debugpy.wait_for_client()  # Blocks execution until client is attached
-
+    heartbeat_thread = None
     try:
         heartbeat_thread = threading.Thread(
             target=heartbeat_and_command_handler, args=(args.port, exit_gracefully))
@@ -1622,7 +1665,8 @@ def main():
     logging_broadcast(f"Napari viewer windows was closed, terminating child processes")
     exit_gracefully.set()
     thread.join()
-    heartbeat_thread.join()
+    if heartbeat_thread is not None:
+        heartbeat_thread.join()
     logging_broadcast(f"stack_gatherer stopped")
 
 
