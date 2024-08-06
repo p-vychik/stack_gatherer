@@ -687,7 +687,7 @@ def load_file_from_input_folder(config_files,
                                                         lapse_id
                                                         )
         else:
-            logging_broadcast(f"Can't parse JSON file time-lapse ID")
+            logging_broadcast("Can't parse JSON file time-lapse ID")
             return
 
         destination_folder = os.path.join(output_dir, os.path.basename(file_path).strip(".json"))
@@ -712,7 +712,7 @@ def load_file_from_input_folder(config_files,
             if len(shared_dict) == 0:
                 for i in SPECIMENS_QUANTITY:
                     shared_dict[i] = manager.Queue()
-                logging_broadcast(f"quickPIV queue was updated")
+                logging_broadcast("quickPIV queue was updated")
         PLOTTING_WINDOW_CREATED = False
         config_files[lapse_id].set_processed()
         try:
@@ -720,7 +720,7 @@ def load_file_from_input_folder(config_files,
                 try:
                     shutil.move(file_path, destination_folder)
                 except Exception as err:
-                    logging_broadcast(f"Attempt to move {file_path} reulted in {err}")
+                    logging_broadcast(f"Attempt to move {file_path} resulted in {err}")
             else:
                 logging_broadcast(f"file {os.path.basename(file_path)} exists in"
                                   f"  {os.path.join(destination_folder, os.path.basename(file_path))}, "
@@ -1352,7 +1352,7 @@ def run_piv_process(shared_dict_queue: dict,
             writer.writerow(['time_point', 'specimen', 'avg_speed'])
         while not stop_process.is_set():
             for queue_number, queue_in in shared_dict_queue.items():
-                logging_broadcast(f"piv heartbeat")
+                logging_broadcast("piv heartbeat")
                 try:
                     plane_matrix = shared_dict_queue[queue_number].get(timeout=1)
                 except Exception as err:
@@ -1492,7 +1492,7 @@ def parse_message_from_microscope(message, exit_gracefully: threading.Event):
 
 
 def heartbeat_and_command_handler(port, exit_gracefully: threading.Event):
-    logging_broadcast(f"heartbeat process started")
+    logging_broadcast("heartbeat process started")
     context = zmq.Context()
     socket = context.socket(zmq.PAIR)
     socket.connect(f"tcp://localhost:{port}")
@@ -1602,6 +1602,8 @@ def main():
                              " supplying peaks detection on telegram messenger")
     parser.add_argument('-debug_run', required=False, default=False, action='store_true',
                         help="All content of --output specified folder will be DELETED!")
+    parser.add_argument('--standalone', required=False, default=False, action='store_true',
+                        help="Does not initiate communication over sockets and does not expect heartbeat from the microscope software.")
     parser.add_argument('-process_z_projections',
                         required=True if '--specimen_quantity' in sys.argv else False, action='store_true',
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
@@ -1640,13 +1642,14 @@ def main():
     # debugpy.listen(('0.0.0.0', 5680))
     # logging_broadcast("Waiting for debugger attach")
     # debugpy.wait_for_client()  # Blocks execution until client is attached
-    heartbeat_thread = None
-    try:
-        heartbeat_thread = threading.Thread(
-            target=heartbeat_and_command_handler, args=(args.port, exit_gracefully))
-        heartbeat_thread.start()
-    except Exception as e:
-        logging_broadcast(f"{args},\n {e}")
+    if not args.standalone:
+        heartbeat_thread = None
+        try:
+            heartbeat_thread = threading.Thread(
+                target=heartbeat_and_command_handler, args=(args.port, exit_gracefully))
+            heartbeat_thread.start()
+        except Exception as e:
+            logging_broadcast(f"{args},\n {e}")
     thread = Thread(target=run_the_loop, args=(vars(args), exit_gracefully))
     thread.start()
     VIEWER = make_napari_viewer()
@@ -1667,7 +1670,7 @@ def main():
     thread.join()
     if heartbeat_thread is not None:
         heartbeat_thread.join()
-    logging_broadcast(f"stack_gatherer stopped")
+    logging_broadcast("stack_gatherer stopped")
 
 
 if __name__ == "__main__":
