@@ -25,6 +25,7 @@ from tifffile import imread, imwrite, memmap
 from tqdm import tqdm
 from PIL import Image
 import asyncio
+import cv2
 from watchfiles import awatch
 from threading import Thread
 from queue import Queue
@@ -40,7 +41,10 @@ from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QMainWindow
 from scipy.signal import find_peaks
 # drift correction import
+from dexp.processing.registration.model.translation_registration_model import TranslationRegistrationModel
 from dexp.processing.registration.translation_nd import register_translation_nd
+from dexp.utils import xpArray
+from dexp.utils.backends import Backend
 from scipy.ndimage import shift as scipy_shift
 
 CURRENT_ACQUISITION_LOGGER = None
@@ -885,12 +889,10 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     axes = kwargs.get("axes", "Z")
     factor = kwargs.get("factor_anisotropy", None)
     TEMP_DIR = kwargs.get("temp_dir", None)
-    PIVJLPATH = kwargs.get("pivjl", "")
+    PIVJLPATH = kwargs.get("pivjl", None)
     bot_config_path = kwargs.get("bot_config", "")
     process_z_projections = kwargs.get("process_z_projections", False)
     token, chat_id = "", ""
-    fix_drift = kwargs.get("correct_drift", False)
-    crop_margin = kwargs.get("margin_crop", 100)
 
     manager = Manager()
     json_config = manager.dict()
@@ -951,9 +953,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                                               PIVJLPATH,
                                               migration_detected,
                                               process_z_projections,
-                                              output_dir,
-                                              fix_drift,
-                                              crop_margin
+                                              output_dir
                                               ),
                 name='piv_run', )
             piv_process.start()
@@ -1216,9 +1216,7 @@ def run_piv_process(shared_dict_queue: dict,
                     piv_path: str,
                     migration_detected: multiprocessing.Queue,
                     save_merged_illumination: bool,
-                    output_dir: str,
-                    fix_drift: bool,
-                    crop_margin: int
+                    output_dir: str
                     ):
     from juliacall import Main as jl
     jl.include(piv_path)
@@ -1275,26 +1273,18 @@ def run_piv_process(shared_dict_queue: dict,
                     # we have to leave the last projection in the piv_projection_queue
                     m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
                     # correct planes drift:
-                    if fix_drift:
-                        logging_broadcast(f"start drift correction")
-                        m_1_copy = m_1.copy()
-                        m_2_copy = m_2.copy()
-                        # Check if shapes are appropriate for cropping
-                        if (m_1.shape[0] <= 2 * crop_margin) or (m_1.shape[1] <= 2 * crop_margin) or \
-                                (m_2.shape[0] <= 2 * crop_margin) or (m_2.shape[1] <= 2 * crop_margin):
-                            logging_broadcast(f"Image dimensions are too small for the specified crop margin."
-                                              f" image 1 shape {m_1.shape}, image 2 shape {m_2.shape}, selected margin"
-                                              f" crop value {crop_margin}")
-                        else:
-                            try:
-                                translation_model = register_translation_nd(m_1, m_2)
-                                m_1 = m_1[crop_margin:-crop_margin, crop_margin:-crop_margin]
-                                corrected_m_2 = scipy_shift(m_2, translation_model.shift_vector)
-                                m_2 = corrected_m_2[crop_margin:-crop_margin, crop_margin:-crop_margin]
-                            except Exception as err:
-                                logging_broadcast(f"drift correction wasn't successful, {err}")
-                                m_1 = m_1_copy
-                                m_2 = m_2_copy
+                    margin = 100
+                    m_1_copy = m_1.copy()
+                    m_2_copy = m_2.copy()
+                    try:
+                        translation_model = register_translation_nd(m_1, m_2)
+                        m_1 = m_1[margin:-margin, margin:-margin]
+                        corrected_m_2 = scipy_shift(m_2, translation_model.shift_vector)
+                        m_2 = corrected_m_2[margin:-margin, margin:-margin]
+                    except Exception as err:
+                        logging_broadcast(f"drift correction wasn't successfull, {err}")
+                        m_1 = m_1_copy
+                        m_2 = m_2_copy
                     if m_1.shape == m_2.shape:
                         try:
                             start_piv = time.time()
@@ -1513,15 +1503,6 @@ def main():
     parser.add_argument('-process_z_projections',
                         required=True if '--specimen_quantity' in sys.argv else False, action='store_true',
                         help="Process input files as Z-projections for average speed calculations with quickPIV!")
-    # Drift correction arguments
-    parser.add_argument('-correct_drift',
-                        required=True if ('--margin_crop' in sys.argv or "-m" in sys.argv) else False,
-                        action='store_true',
-                        help="Process input files with dexp drift correction")
-    parser.add_argument('-m', '--margin_crop', type=int,
-                        required=True if '-correct_drift' in sys.argv else False,
-                        help="Value is used for cropping image's margin to get rid of zero valued pixels "
-                             "which appear after image shift correction")
     # When the microscope controller restarts the stack_gatherer, this argument defines the configuration file
     # of the unfinished image batch with which the processing will start
     parser.add_argument('-r', '--restart', required=False, default=None,
