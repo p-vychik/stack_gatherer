@@ -895,7 +895,6 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     manager = Manager()
     json_config = manager.dict()
     shared_queues_of_z_projections = None
-    PIVJLPATH = "E:/PV/git_repo/get_avg_speed_quickpiv.jl"
     if PIVJLPATH:
         shared_queues_of_z_projections = manager.dict()
     # Start the input directory observer
