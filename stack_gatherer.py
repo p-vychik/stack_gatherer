@@ -632,6 +632,7 @@ def load_file_from_input_folder(file_path,
                                 shared_dict,
                                 json_dict,
                                 manager,
+                                crop_mask_coordinates,
                                 factor=1,
                                 axes=""):
     global SPECIMENS_QUANTITY
@@ -663,6 +664,7 @@ def load_file_from_input_folder(file_path,
             if len(shared_dict) == 0:
                 for i in SPECIMENS_QUANTITY:
                     shared_dict[i] = manager.Queue()
+                    crop_mask_coordinates[i] = []
                 logging_broadcast(f"quickPIV queue was updated")
         PLOTTING_WINDOW_CREATED = False
 
@@ -710,29 +712,95 @@ def load_file_from_input_folder(file_path,
             logging_broadcast(f"load_file_from_input_folder was unsuccessful, {err}")
 
 
-def update_napari_viewer_layer():
+def extract_and_display_selection(shape_layer, min_coords, max_coords, crop_mask_coordinates):
+    try:
+        print(shape_layer.name)
+        image_layer_name = shape_layer.name.split("Crop mask ")[1]
+        # image_layer_name = re.sub(r"TP_\d+", "", image_layer_name)
+        specimen = int(image_layer_name.split("SPC_")[1].split("_")[0])
+        if specimen in crop_mask_coordinates:
+            crop_mask_coordinates[specimen] = (min_coords, max_coords)
+        else:
+            logging_broadcast("Can't save cropping mask into the shared dictionary, key index is not present!")
+        # for testing selection mask only
+        # for layer in VIEWER.layers:
+        #     if isinstance(layer, napari.layers.Image):
+        #         layer_name = re.sub(r"TP_\d+_", "", layer.name)
+        #         if layer_name != image_layer_name:
+        #             continue
+        #         selected_region = VIEWER.layers[layer.name].data[
+        #                           min_coords[0]:max_coords[0],
+        #                           min_coords[1]:max_coords[1]
+        #                           ]
+        #         imwrite(f"F:/{shape_layer.name}_{time.time()}.tiff", selected_region)
+    except Exception as err:
+        logging_broadcast(f"Exception extract_and_display: {err}")
+
+
+def on_rectangle_selection(shapes_layer, event, crop_mask_coordinates):
+    # Check if the current tool is the rectangle tool
+    # Start with the initial mouse press event
+    if event.type == "mouse_press" and shapes_layer.mode == "add_rectangle":
+        # Clear any existing rectangles to ensure only one is visible
+        shapes_layer.data = []
+    # Start with the initial press
+    yield
+    while event.type == "mouse_move":
+        # Handling the drag/move event
+        yield
+    if len(shapes_layer.data) > 0 and event.type == "mouse_release" and shapes_layer.mode == "add_rectangle":
+        # Get the last drawn rectangle
+        rectangle = shapes_layer.data[-1]
+        min_coords = np.min(rectangle, axis=0).astype(int)
+        max_coords = np.max(rectangle, axis=0).astype(int)
+        extract_and_display_selection(shapes_layer, min_coords, max_coords, crop_mask_coordinates)
+
+
+def update_napari_viewer_layer(crop_mask_coordinates):
     global LAYERS_INPUT
     if LAYERS_INPUT.qsize() > 0:
         data_input = LAYERS_INPUT.get()
         for axes_names, image in data_input.items():
             match = re.search(r'TP_(\d+)', axes_names)
             if match:
-                current_tp = int(match.group(1))
-                previous_tp = current_tp - 1
-                previous_axes_names = re.sub(r'TP_\d+', f'TP_{previous_tp}', axes_names)
-                # Check if the previous layer exists and delete it if it does
-                if previous_axes_names in VIEWER.layers:
-                    del VIEWER.layers[previous_axes_names]
+                time_point = int(match.group(1))
+                drawn_layer_key = re.sub(r'TP_\d+', f'TP_{time_point - 1}', axes_names)
 
-            if axes_names not in VIEWER.layers:
-                VIEWER.add_image(image, name=axes_names)
-            else:
-                layer_image = VIEWER.layers[axes_names]
-                VIEWER.layers[axes_names].data = image
+                if drawn_layer_key not in VIEWER.layers:
+                    # Add a new layer if it doesn't exist
+                    layer_image = VIEWER.add_image(image, name=axes_names)
+                    mask_name = re.sub(r'TP_\d+_', "", axes_names)
+                    shape_layer = VIEWER.add_shapes(name=f"Crop mask {mask_name}", shape_type='rectangle')
+                    # track changes on shape_layer
+                    shape_layer.mouse_drag_callbacks.append(lambda layer, event: on_rectangle_selection(layer,
+                                                                                                        event,
+                                                                                                        crop_mask_coordinates))
+
+                else:
+                    # Retrieve the existing layer
+                    layer_image = VIEWER.layers[drawn_layer_key]
+
+                    # Check if there is an existing selection
+                    existing_selection = None
+                    if hasattr(layer_image, 'selected_data') and len(layer_image.selected_data) > 0:
+                        existing_selection = layer_image.selected_data[0]
+
+                    # Update the layer data and rename it
+                    layer_image.data = image
+                    layer_image.name = axes_names
+
+                    # Restore the previous selection if it exists
+                    if existing_selection:
+                        layer_image.selected_data = [existing_selection]
+                    # layer_image.mouse_drag_callbacks.append(callback_wrapper)
+                # Adjust contrast limits if necessary
                 if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
                     VIEWER.layers[axes_names].reset_contrast_limits()
                 if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
                     VIEWER.layers[axes_names].reset_contrast_limits()
+        for layer in VIEWER.layers:
+            layer.visible = False
+        VIEWER.layers[-1].visible = True
 
 
 def get_lapse_id(file_name):
@@ -839,7 +907,8 @@ async def read_input_files(input_folder,
                            manager,
                            factor,
                            axes,
-                           exit_gracefully: threading.Event):
+                           exit_gracefully: threading.Event,
+                           crop_mask_coordinates):
 
 
     try:
@@ -858,6 +927,7 @@ async def read_input_files(input_folder,
                                                     shared_queues_of_z_projections,
                                                     json_config,
                                                     manager,
+                                                    crop_mask_coordinates,
                                                     factor,
                                                     axes)
                     except Exception as err:
@@ -872,7 +942,7 @@ def watchfiles_thread(*args):
     logging_broadcast("watchfiles finished")
 
 
-def run_the_loop(kwargs, exit_gracefully: threading.Event):
+def run_the_loop(kwargs, exit_gracefully: threading.Event, manager, crop_mask_coordinates):
     global PIVJLPATH
     global TEMP_DIR
     global SPECIMENS_QUANTITY_LOADED
@@ -892,7 +962,7 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
     fix_drift = kwargs.get("correct_drift", False)
     crop_margin = kwargs.get("margin_crop", 100)
 
-    manager = Manager()
+    # manager = Manager()
     json_config = manager.dict()
     shared_queues_of_z_projections = None
     if PIVJLPATH:
@@ -906,7 +976,8 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                                                     manager,
                                                     factor,
                                                     axes,
-                                                    exit_gracefully),
+                                                    exit_gracefully,
+                                                    crop_mask_coordinates),
                     daemon=False
                     )
     if not process_z_projections:
@@ -953,7 +1024,8 @@ def run_the_loop(kwargs, exit_gracefully: threading.Event):
                                               process_z_projections,
                                               output_dir,
                                               fix_drift,
-                                              crop_margin
+                                              crop_margin,
+                                              crop_mask_coordinates
                                               ),
                 name='piv_run', )
             piv_process.start()
@@ -1218,11 +1290,14 @@ def run_piv_process(shared_dict_queue: dict,
                     save_merged_illumination: bool,
                     output_dir: str,
                     fix_drift: bool,
-                    crop_margin: int
+                    crop_margin: int,
+                    crop_mask_coordinates
                     ):
     from juliacall import Main as jl
     jl.include(piv_path)
     piv_projection_queue, projections_to_process, ts_dict = dict(), dict(), dict()
+    # queue_number corresponds to the specimen index from JSON config file or
+    # to the SPC_ value in plane name if we process collected z-projections
     for queue_number, _ in shared_dict_queue.items():
         piv_projection_queue[queue_number] = Queue()
         projections_to_process[queue_number] = Queue()
@@ -1274,6 +1349,17 @@ def run_piv_process(shared_dict_queue: dict,
                     # to compare projections in a consecutive way,
                     # we have to leave the last projection in the piv_projection_queue
                     m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
+                    # crop images according to user selection
+                    try:
+                        if crop_mask_coordinates[queue_number]:
+                            min_coords, max_coords = crop_mask_coordinates[queue_number]
+                            m_1 = m_1[min_coords[0]:max_coords[0], min_coords[1]:max_coords[1]]
+                            m_2 = m_2[min_coords[0]:max_coords[0], min_coords[1]:max_coords[1]]
+                            logging_broadcast(f"piv run with crop mask for specimen {queue_number},"
+                                              f" coordinates min {min_coords[0], min_coords[1]}, "
+                                              f"max {max_coords[0], max_coords[1]}")
+                    except Exception as err:
+                        logging_broadcast(f"crop mask resulted in error: {err}")
                     # correct planes drift:
                     if fix_drift:
                         logging_broadcast(f"start drift correction")
@@ -1564,14 +1650,16 @@ def main():
         heartbeat_thread.start()
     except Exception as e:
         logging_broadcast(f"{args},\n {e}")
-    thread = Thread(target=run_the_loop, args=(vars(args), exit_gracefully))
+    manager = Manager()
+    crop_mask_coordinates = manager.dict()
+    thread = Thread(target=run_the_loop, args=(vars(args), exit_gracefully, manager, crop_mask_coordinates))
     thread.start()
     VIEWER = make_napari_viewer()
     timer1 = QTimer()
     timer1.timeout.connect(update_avg_speed_plot_windows)
     timer1.start(25)
     timer2 = QTimer()
-    timer2.timeout.connect(update_napari_viewer_layer)
+    timer2.timeout.connect(lambda: update_napari_viewer_layer(crop_mask_coordinates))
     timer2.start(10)
     plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(exit_gracefully))
     plotting_windows_timer.start(1000)
