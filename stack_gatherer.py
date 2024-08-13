@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import List
 from datetime import datetime
 from multiprocessing import Manager, Event
+from multiprocessing.managers import DictProxy
 import zmq
 from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import QTimer
@@ -756,7 +757,8 @@ def on_rectangle_selection(shapes_layer, event, crop_mask_coordinates):
         extract_and_display_selection(shapes_layer, min_coords, max_coords, crop_mask_coordinates)
 
 
-def update_napari_viewer_layer(crop_mask_coordinates):
+def update_napari_viewer_layer(napari_viewer,
+                               crop_mask_coordinates: DictProxy) -> None:
     global LAYERS_INPUT
     if LAYERS_INPUT.qsize() > 0:
         data_input = LAYERS_INPUT.get()
@@ -766,19 +768,21 @@ def update_napari_viewer_layer(crop_mask_coordinates):
                 time_point = int(match.group(1))
                 drawn_layer_key = re.sub(r'TP_\d+', f'TP_{time_point - 1}', axes_names)
 
-                if drawn_layer_key not in VIEWER.layers:
+                if drawn_layer_key not in napari_viewer.layers:
                     # Add a new layer if it doesn't exist
-                    layer_image = VIEWER.add_image(image, name=axes_names)
+                    layer_image = napari_viewer.add_image(image, name=axes_names)
                     mask_name = re.sub(r'TP_\d+_', "", axes_names)
-                    shape_layer = VIEWER.add_shapes(name=f"Crop mask {mask_name}", shape_type='rectangle')
+                    shape_layer = napari_viewer.add_shapes(name=f"Crop mask {mask_name}", shape_type='rectangle')
                     # track changes on shape_layer
-                    shape_layer.mouse_drag_callbacks.append(lambda layer, event: on_rectangle_selection(layer,
-                                                                                                        event,
-                                                                                                        crop_mask_coordinates))
+                    shape_layer.mouse_drag_callbacks.append(lambda layer, event:
+                                                            on_rectangle_selection(layer,
+                                                                                   event,
+                                                                                   crop_mask_coordinates)
+                                                            )
 
                 else:
                     # Retrieve the existing layer
-                    layer_image = VIEWER.layers[drawn_layer_key]
+                    layer_image = napari_viewer.layers[drawn_layer_key]
 
                     # Check if there is an existing selection
                     existing_selection = None
@@ -795,12 +799,19 @@ def update_napari_viewer_layer(crop_mask_coordinates):
                     # layer_image.mouse_drag_callbacks.append(callback_wrapper)
                 # Adjust contrast limits if necessary
                 if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
-                    VIEWER.layers[axes_names].reset_contrast_limits()
+                    napari_viewer.layers[axes_names].reset_contrast_limits()
                 if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
-                    VIEWER.layers[axes_names].reset_contrast_limits()
-        for layer in VIEWER.layers:
-            layer.visible = False
-        VIEWER.layers[-1].visible = True
+                    napari_viewer.layers[axes_names].reset_contrast_limits()
+        visible_specimens = set()
+        for layer in napari_viewer.layers:
+            specimen_index = parse_specimen_index(layer.name)
+            if layer in VIEWER.layers.selection or layer.visible:
+                visible_specimens.add(specimen_index)
+            if specimen_index not in visible_specimens:
+                layer.visible = False
+        if not len(napari_viewer.layers.selection) and len(VIEWER.layers) >= 2:
+            napari_viewer.layers[-1].visible = True
+            napari_viewer.layers[-2].visible = True
 
 
 def get_lapse_id(file_name):
@@ -909,7 +920,6 @@ async def read_input_files(input_folder,
                            axes,
                            exit_gracefully: threading.Event,
                            crop_mask_coordinates):
-
 
     try:
         async for changes in awatch(input_folder):
@@ -1272,12 +1282,39 @@ def bx_trigger():
     MERGE_LIGHT_MODES = not MERGE_LIGHT_MODES
 
 
+def parse_specimen_index(name):
+    """Extract the specimen index from the event value name"""
+    try:
+        return name.split("SPC_")[1].split("_")[0]
+    except (IndexError, AttributeError) as err:
+        print(f"Problem with layer name parsing, def on_selection: {err}")
+        return None
+
+
+def update_layer_visibility(viewer, specimen_index):
+    """Update the visibility and selection of layers based on the specimen index"""
+    for layer in viewer.layers:
+        is_target_layer = f"SPC_{specimen_index}_" in layer.name
+        layer.visible = is_target_layer
+
+
+def on_selection(viewer, event):
+    """Handle layer selection based on the event"""
+    if not event.value:
+        return
+
+    specimen_index = parse_specimen_index(event.value.name)
+    if specimen_index:
+        update_layer_visibility(viewer, specimen_index)
+
+
 def make_napari_viewer():
     napari_viewer = napari.Viewer()
     bx = QCheckBox('Merge illumination channels')
     bx.setChecked(MERGE_LIGHT_MODES)
     bx.stateChanged.connect(bx_trigger)
     napari_viewer.window.add_dock_widget(bx)
+    napari_viewer.layers.selection.events.active.connect(lambda event: on_selection(napari_viewer, event))
     return napari_viewer
 
 
@@ -1659,7 +1696,7 @@ def main():
     timer1.timeout.connect(update_avg_speed_plot_windows)
     timer1.start(25)
     timer2 = QTimer()
-    timer2.timeout.connect(lambda: update_napari_viewer_layer(crop_mask_coordinates))
+    timer2.timeout.connect(lambda: update_napari_viewer_layer(VIEWER, crop_mask_coordinates))
     timer2.start(10)
     plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(exit_gracefully))
     plotting_windows_timer.start(1000)
