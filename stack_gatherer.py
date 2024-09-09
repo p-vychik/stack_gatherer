@@ -12,10 +12,11 @@ import csv
 import time
 import os
 import re
+
 import numpy as np
+from numpy.typing import NDArray
 import napari
 import multiprocessing
-import traceback
 import requests
 import threading
 import pandas as pd
@@ -32,9 +33,9 @@ from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
 from dataclasses import dataclass, field
 from typing import List
+from typing import Union
 from datetime import datetime
-from multiprocessing import Manager, Event
-# from multiprocessing.managers import DictProxy
+from multiprocessing import Manager
 import zmq
 from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import QTimer
@@ -52,8 +53,6 @@ ACQUISITION_META_FILE_PATTERN = "AcquisitionMetadata_"
 BORDER_WIDTH = 20
 PLT_WIDGET_X_AXIS_LENGTH = 40
 MERGE_LIGHT_MODES = False
-# napari viewer window
-VIEWER = None
 # separate matplotlib windows for each specimen
 PLT_WIDGETS_DICT = {}
 plotting_windows_timer = QTimer()
@@ -62,7 +61,6 @@ command_queue_to_microscope = Queue()
 new_microscope_command_event = threading.Event()
 HEARTBEAT_FROM_MICROSCOPE_TIMEOUT_sec = 10
 ACQUISITION_METADATA_FILE_TO_PROCESS = ""
-
 
 
 def setup_main_logger(output_dir):
@@ -137,61 +135,38 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
             logging_broadcast(f"plot_curve exception: {err}")
 
 
-class PivProcess(multiprocessing.Process):
-    def __init__(self, *args, **kwargs):
-        multiprocessing.Process.__init__(self, *args, **kwargs)
-        self._pconn, self._cconn = multiprocessing.Pipe()
-        self._exception = None
-
-    def run(self):
-        try:
-            multiprocessing.Process.run(self)
-            self._cconn.send(None)
-        except Exception as e:
-            tb = traceback.format_exc()
-            self._cconn.send((e, tb))
-
-    @property
-    def exception(self):
-        if self._pconn.poll():
-            self._exception = self._pconn.recv()
-            logging_broadcast(self._exception[0])
-        return self._exception
-
-
 class TimelapseSharedState:
     def __init__(self, manager):
         self.crop_mask_coordinates = manager.dict()
         self.json_config = manager.dict()
-        self.shared_queues_of_z_projections = manager.dict()
+        self.maxprojection_queues_dict = manager.dict()
         self.migration_detected = manager.Queue()
         self.avg_speed_data = manager.list()
         self.active_stacks = {}
-        self.currently_saving_stacks_locks = manager.dict()
-        self.currently_saving_stacks_dict_lock = multiprocessing.Lock()
+        self.currently_saving_stacks_dict = manager.dict()
+        self.currently_saving_stacks_lock = multiprocessing.Lock()
         self.exit_gracefully = multiprocessing.Event()
-        self.LAYERS_INPUT = manager.Queue()
-        self.PIV_OUTPUT = manager.Queue()
-        self.PROJECTIONS_QUEUE = OrderedDict()
-        self.DRAWN_PROJECTIONS_QUEUE = OrderedDict()
-        self.JSON_CONFIGS = manager.dict()
-        self.SPECIMENS_QUANTITY_LOADED = False
-        self.SPECIMENS_QUANTITY = manager.list()
-        self.PLOTTING_WINDOW_CREATED = False
-        self.TEMP_DIR = ""
-        self.PIVJLPATH = ""
+        self.napari_layers_to_show_queue = manager.Queue()
+        self.quick_piv_output_queue = manager.Queue()
+        self.projections_to_napari_dict = OrderedDict()
+        self.shown_napari_layers_dict = OrderedDict()
+        self.specimen_indices_loaded = False
+        self.specimens_indices_list = manager.list()
+        self.plotting_window_created = False
+        self.temp_dir = ""
+        self.pivjl_script_path = ""
 
     def update_piv_queues(self, manager):
-        if len(self.shared_queues_of_z_projections) == 0:
-            for i in self.SPECIMENS_QUANTITY:
-                self.shared_queues_of_z_projections[i] = manager.Queue()
+        if len(self.maxprojection_queues_dict) == 0:
+            for i in self.specimens_indices_list:
+                self.maxprojection_queues_dict[i] = manager.Queue()
                 self.crop_mask_coordinates[i] = manager.list()
             logging_broadcast(f"quickPIV queue was updated")
 
     def reset_shared_queues(self, specimen_indices, manager):
-        self.SPECIMENS_QUANTITY.extend(sorted(specimen_indices))
+        self.specimens_indices_list.extend(sorted(specimen_indices))
         for index in specimen_indices:
-            self.shared_queues_of_z_projections[index] = manager.Queue()
+            self.maxprojection_queues_dict[index] = manager.Queue()
 
 
 class NotImagePlaneFile(Exception):
@@ -405,7 +380,7 @@ class ImageFile:
                               self.channel)
 
 
-def read_image(image_path):
+def read_image(image_path: str) -> Union[NDArray, bool]:
     if image_path.upper().endswith((".TIF", ".TIFF")):
         time.sleep(0.1)
         try:
@@ -475,7 +450,6 @@ def plane_to_projection(plane: np.ndarray, output_dictionary: dict):
 
 
 def collect_files_to_one_stack_get_axial_projections(shared_state: TimelapseSharedState,
-                                                     manager: Manager,
                                                      stack_signature: StackSignature,
                                                      file_list: list,
                                                      output_file_path: str,
@@ -548,9 +522,9 @@ def collect_files_to_one_stack_get_axial_projections(shared_state: TimelapseShar
             # push to the queue for PIV calculations
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
             # here we should put the projection with clear identification of species and other parameters
-            if shared_state.shared_queues_of_z_projections is not None:
-                if stack_signature.specimen in shared_state.shared_queues_of_z_projections:
-                    shared_state.shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
+            if shared_state.maxprojection_queues_dict is not None:
+                if stack_signature.specimen in shared_state.maxprojection_queues_dict:
+                    shared_state.maxprojection_queues_dict[stack_signature.specimen].put(wrapped_z_projection)
                 else:
                     logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
         for axis in projections.keys():
@@ -563,10 +537,10 @@ def collect_files_to_one_stack_get_axial_projections(shared_state: TimelapseShar
         # we want to store projections derived from planes with different illumination modes to
         # have an option to merge them if the user checked the QCheckBox() in napari viewer GUI interface
         wrapped_projections = ProjectionsDictWrapper(projections, stack_signature)
-        if wrapped_projections.signature not in shared_state.PROJECTIONS_QUEUE:
-            shared_state.PROJECTIONS_QUEUE[wrapped_projections.identifier] = [wrapped_projections]
+        if wrapped_projections.signature not in shared_state.projections_to_napari_dict:
+            shared_state.projections_to_napari_dict[wrapped_projections.identifier] = [wrapped_projections]
         else:
-            shared_state.PROJECTIONS_QUEUE[wrapped_projections.identifier].append(wrapped_projections)
+            shared_state.projections_to_napari_dict[wrapped_projections.identifier].append(wrapped_projections)
 
     for z in range(shape[0]):
         try:
@@ -589,7 +563,6 @@ def add_file_to_active_stacks(shared_state: TimelapseSharedState,
 
 
 def check_stack_and_collect_if_ready(shared_state: TimelapseSharedState,
-                                     manager,
                                      stack_signature: StackSignature,
                                      output_dir,
                                      axes=None,
@@ -597,33 +570,32 @@ def check_stack_and_collect_if_ready(shared_state: TimelapseSharedState,
     if len(shared_state.active_stacks[stack_signature.signature]) < stack_signature.total_num_planes:
         return
     # We have to ensure that two events firing at the same time don't start saving the same stack twice
-    with shared_state.currently_saving_stacks_dict_lock:
-        if stack_signature not in shared_state.currently_saving_stacks_locks:
-            shared_state.currently_saving_stacks_locks[stack_signature.signature] = True
+    with shared_state.currently_saving_stacks_lock:
+        if stack_signature not in shared_state.currently_saving_stacks_dict:
+            shared_state.currently_saving_stacks_dict[stack_signature.signature] = True
         else:
             return
-    file_list = []
-    for i, _ in enumerate(shared_state.active_stacks[stack_signature.signature]):
-        # We have to access by index since we can't guarantee that files were added to dict in order of planes
-        file_list.append(shared_state.active_stacks[stack_signature.signature][i].get_file_path())
-    sample_file_obj = ImageFile(file_list[0])
-    sample_file_obj.extension = "tif"
-    stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
-    collect_files_to_one_stack_get_axial_projections(shared_state,
-                                                     manager,
-                                                     stack_signature,
-                                                     file_list,
-                                                     stack_path,
-                                                     axes=axes,
-                                                     anisotropy_factor=factor,
-                                                     output_dir=output_dir
-                                                     )
+        file_list = []
+        for i, _ in enumerate(shared_state.active_stacks[stack_signature.signature]):
+            # We have to access by index since we can't guarantee that files were added to dict in order of planes
+            file_list.append(shared_state.active_stacks[stack_signature.signature][i].get_file_path())
+        sample_file_obj = ImageFile(file_list[0])
+        sample_file_obj.extension = "tif"
+        stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
+        collect_files_to_one_stack_get_axial_projections(shared_state,
+                                                         stack_signature,
+                                                         file_list,
+                                                         stack_path,
+                                                         axes=axes,
+                                                         anisotropy_factor=factor,
+                                                         output_dir=output_dir
+                                                         )
 
-    images_dict = get_projections_dict_from_queue(shared_state)
-    if images_dict:
-        shared_state.LAYERS_INPUT.put(images_dict)
-    del shared_state.active_stacks[stack_signature.signature]
-    del shared_state.currently_saving_stacks_locks[stack_signature.signature]
+        images_dict = get_projections_dict_from_queue(shared_state)
+        if images_dict:
+            shared_state.napari_layers_to_show_queue.put(images_dict)
+        del shared_state.active_stacks[stack_signature.signature]
+        del shared_state.currently_saving_stacks_dict[stack_signature.signature]
 
 
 def load_lapse_parameters_json(file_path: str,
@@ -670,7 +642,6 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
                                 factor=1,
                                 axes=""):
 
-
     if os.path.isdir(file_path):
         return
     # load json parameters
@@ -688,14 +659,14 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
         shared_state.json_config.update(dict.fromkeys(list_of_stack_signatures, metadata_json))
         # get specimens quantity
         try:
-            shared_state.SPECIMENS_QUANTITY = [specimen_dict['userDefinedIndex'] for specimen_dict in metadata_json['specimens']]
-            shared_state.SPECIMENS_QUANTITY_LOADED = True
+            shared_state.specimens_indices_list = [specimen_dict['userDefinedIndex'] for specimen_dict in metadata_json['specimens']]
+            shared_state.specimen_indices_loaded = True
         except Exception as err:
             logging_broadcast(f"Failed to set specimen quantity {err}")
-        if len(shared_state.SPECIMENS_QUANTITY) and shared_state.shared_queues_of_z_projections is not None:
+        if len(shared_state.specimens_indices_list) and shared_state.maxprojection_queues_dict is not None:
             shared_state.update_piv_queues(manager)
 
-        shared_state.PLOTTING_WINDOW_CREATED = False
+        shared_state.plotting_window_created = False
 
         try:
             if not os.path.exists(os.path.join(destination_folder, os.path.basename(file_path))):
@@ -720,9 +691,9 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
         except NotImagePlaneFile:
             # image file is incorrect, move it to the temp_dir
             try:
-                shutil.move(file_path, shared_state.TEMP_DIR)
+                shutil.move(file_path, shared_state.temp_dir)
             except Exception as err:
-                logging_broadcast(f"Moving {file_path} to {shared_state.TEMP_DIR} resulted in {err}")
+                logging_broadcast(f"Moving {file_path} to {shared_state.temp_dir} resulted in {err}")
             return
         stack_signature = add_file_to_active_stacks(shared_state, file)
         # create separate folder for the output based on metadata filename
@@ -731,7 +702,6 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
                 output_dir = shared_state.json_config[stack_signature.signature_no_time]["output_folder"]
                 if os.path.exists(output_dir):
                     check_stack_and_collect_if_ready(shared_state,
-                                                     manager,
                                                      stack_signature,
                                                      output_dir,
                                                      axes,
@@ -752,17 +722,6 @@ def extract_and_display_selection(shape_layer, min_coords, max_coords, shared_st
             shared_state.crop_mask_coordinates[specimen] = (min_coords, max_coords)
         else:
             logging_broadcast("Can't save cropping mask into the shared dictionary, key index is not present!")
-        # for testing selection mask only
-        # for layer in VIEWER.layers:
-        #     if isinstance(layer, napari.layers.Image):
-        #         layer_name = re.sub(r"TP_\d+_", "", layer.name)
-        #         if layer_name != image_layer_name:
-        #             continue
-        #         selected_region = VIEWER.layers[layer.name].data[
-        #                           min_coords[0]:max_coords[0],
-        #                           min_coords[1]:max_coords[1]
-        #                           ]
-        #         imwrite(f"F:/{shape_layer.name}_{time.time()}.tiff", selected_region)
     except Exception as err:
         logging_broadcast(f"Exception extract_and_display: {err}")
 
@@ -786,21 +745,20 @@ def on_rectangle_selection(shapes_layer, event, shared_state: TimelapseSharedSta
         extract_and_display_selection(shapes_layer, min_coords, max_coords, shared_state)
 
 
-def update_napari_viewer_layer(shared_state: TimelapseSharedState) -> None:
-    # global LAYERS_INPUT
-    if shared_state.LAYERS_INPUT.qsize() > 0:
-        data_input = shared_state.LAYERS_INPUT.get()
+def update_napari_viewer_layer(shared_state: TimelapseSharedState, napari_viewer) -> None:
+    if shared_state.napari_layers_to_show_queue.qsize() > 0:
+        data_input = shared_state.napari_layers_to_show_queue.get()
         for axes_names, image in data_input.items():
             match = re.search(r'TP_(\d+)', axes_names)
             if match:
                 time_point = int(match.group(1))
                 drawn_layer_key = re.sub(r'TP_\d+', f'TP_{time_point - 1}', axes_names)
 
-                if drawn_layer_key not in VIEWER.layers:
+                if drawn_layer_key not in napari_viewer.layers:
                     # Add a new layer if it doesn't exist
-                    layer_image = VIEWER.add_image(image, name=axes_names)
+                    layer_image = napari_viewer.add_image(image, name=axes_names)
                     mask_name = re.sub(r'TP_\d+_', "", axes_names)
-                    shape_layer = VIEWER.add_shapes(name=f"Crop mask {mask_name}", shape_type='rectangle')
+                    shape_layer = napari_viewer.add_shapes(name=f"Crop mask {mask_name}", shape_type='rectangle')
                     # track changes on shape_layer
                     shape_layer.mouse_drag_callbacks.append(lambda layer, event:
                                                             on_rectangle_selection(layer,
@@ -810,7 +768,7 @@ def update_napari_viewer_layer(shared_state: TimelapseSharedState) -> None:
 
                 else:
                     # Retrieve the existing layer
-                    layer_image = VIEWER.layers[drawn_layer_key]
+                    layer_image = napari_viewer.layers[drawn_layer_key]
 
                     # Check if there is an existing selection
                     existing_selection = None
@@ -827,19 +785,19 @@ def update_napari_viewer_layer(shared_state: TimelapseSharedState) -> None:
                     # layer_image.mouse_drag_callbacks.append(callback_wrapper)
                 # Adjust contrast limits if necessary
                 if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
-                    VIEWER.layers[axes_names].reset_contrast_limits()
+                    napari_viewer.layers[axes_names].reset_contrast_limits()
                 if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
-                    VIEWER.layers[axes_names].reset_contrast_limits()
+                    napari_viewer.layers[axes_names].reset_contrast_limits()
         visible_specimens = set()
-        for layer in VIEWER.layers:
+        for layer in napari_viewer.layers:
             specimen_index = parse_specimen_index(layer.name)
-            if layer in VIEWER.layers.selection or layer.visible:
+            if layer in napari_viewer.layers.selection or layer.visible:
                 visible_specimens.add(specimen_index)
             if specimen_index not in visible_specimens:
                 layer.visible = False
-        if not len(VIEWER.layers.selection) and len(VIEWER.layers) >= 2:
-            VIEWER.layers[-1].visible = True
-            VIEWER.layers[-2].visible = True
+        if not len(napari_viewer.layers.selection) and len(napari_viewer.layers) >= 2:
+            napari_viewer.layers[-1].visible = True
+            napari_viewer.layers[-2].visible = True
 
 
 def get_lapse_id(file_name):
@@ -947,6 +905,8 @@ async def read_input_files(shared_state,
                            axes):
     try:
         async for changes in awatch(input_folder):
+            if shared_state.exit_gracefully.is_set():
+                break
             paths = []
             for change in changes:
                 event, file_path = change
@@ -981,18 +941,14 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
     output_dir = kwargs.get("output")
     axes = kwargs.get("axes", "Z")
     factor = kwargs.get("factor_anisotropy", None)
-    shared_state.TEMP_DIR = kwargs.get("temp_dir", None)
-    shared_state.PIVJLPATH = kwargs.get("pivjl", "")
+    shared_state.temp_dir = kwargs.get("temp_dir", None)
+    shared_state.pivjl_script_path = kwargs.get("pivjl", "")
     bot_config_path = kwargs.get("bot_config", "")
     process_z_projections = kwargs.get("process_z_projections", False)
     token, chat_id = "", ""
     fix_drift = kwargs.get("correct_drift", False)
     crop_margin = kwargs.get("margin_crop", 100)
 
-    if shared_state.PIVJLPATH:
-        with open(shared_state.PIVJLPATH, 'r') as f:
-            content = f.readlines()
-            logging_broadcast("\n".join(content))
     # Start the input directory observer
     logging_broadcast(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
     thread = Thread(target=watchfiles_thread, args=(shared_state,
@@ -1008,10 +964,9 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
 
     while True:
         # RESET avg_speed_data and migration_detected for shared_state object!
-        stop_process = Event()
 
-        if shared_state.PIVJLPATH:
-            while (not shared_state.SPECIMENS_QUANTITY_LOADED
+        if shared_state.pivjl_script_path:
+            while (not shared_state.specimen_indices_loaded
                    and not process_z_projections
                    and not shared_state.exit_gracefully.is_set()):
                 time.sleep(1)
@@ -1026,8 +981,8 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                 if specimen_indices:
                     shared_state.reset_shared_queues(specimen_indices, manager)
 
-            if len(shared_state.SPECIMENS_QUANTITY):
-                shared_state.SPECIMENS_QUANTITY_LOADED = False
+            if len(shared_state.specimens_indices_list):
+                shared_state.specimen_indices_loaded = False
 
             if bot_config_path:
                 with open(bot_config_path) as fin:
@@ -1036,9 +991,8 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                         token, chat_id = line.strip().split(" ")
                     except Exception as err:
                         logging_broadcast(err)
-            piv_process = PivProcess(
+            piv_process = multiprocessing.Process(
                 target=run_piv_process, args=(shared_state,
-                                              stop_process,
                                               process_z_projections,
                                               output_dir,
                                               fix_drift,
@@ -1062,20 +1016,21 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                         stack_signature = img_metadata.get_stack_signature()
                         wrapped_z_projection = ProjectionsDictWrapper({"Z": img_data}, stack_signature)
                         # push projection to the queue for PIV calculations
-                        if stack_signature.specimen in shared_state.shared_queues_of_z_projections:
+                        if stack_signature.specimen in shared_state.maxprojection_queues_dict:
                             while True:
-                                if shared_state.shared_queues_of_z_projections[stack_signature.specimen].qsize() > 10:
+                                if shared_state.maxprojection_queues_dict[stack_signature.specimen].qsize() > 10:
                                     time.sleep(1)
                                 else:
                                     break
-                            if wrapped_z_projection.signature not in shared_state.PROJECTIONS_QUEUE:
-                                shared_state.PROJECTIONS_QUEUE[wrapped_z_projection.identifier] = [wrapped_z_projection]
+                            if wrapped_z_projection.signature not in shared_state.projections_to_napari_dict:
+                                shared_state.projections_to_napari_dict[wrapped_z_projection.identifier] = \
+                                    [wrapped_z_projection]
                             else:
-                                shared_state.PROJECTIONS_QUEUE[wrapped_z_projection.identifier].append(wrapped_z_projection)
-                            images_dict = get_projections_dict_from_queue()
+                                shared_state.projections_to_napari_dict[wrapped_z_projection.identifier].append(wrapped_z_projection)
+                            images_dict = get_projections_dict_from_queue(shared_state)
                             if images_dict:
-                                shared_state.LAYERS_INPUT.put(images_dict)
-                            shared_state.shared_queues_of_z_projections[stack_signature.specimen].put(wrapped_z_projection)
+                                shared_state.napari_layers_to_show_queue.put(images_dict)
+                            shared_state.maxprojection_queues_dict[stack_signature.specimen].put(wrapped_z_projection)
                         else:
                             logging_broadcast(f"Specimen index {stack_signature.specimen} was not found, check "
                                               f"if file name format follows the expected name pattern")
@@ -1086,7 +1041,7 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
             check_next = time.time() + 60
             speed_list_length = len(shared_state.avg_speed_data)
             while (not os.path.exists(stop_file)
-                   and not shared_state.SPECIMENS_QUANTITY_LOADED
+                   and not shared_state.specimen_indices_loaded
                    and not shared_state.exit_gracefully.is_set()):
                 if shared_state.migration_detected.qsize() > 0:
                     migration_event = shared_state.migration_detected.get()
@@ -1111,16 +1066,11 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                         speed_list_length = len(shared_state.avg_speed_data)
                 # Sleep to keep the script running
                 time.sleep(1)
-            if shared_state.PIVJLPATH:
-                stop_process.set()
+            if shared_state.pivjl_script_path:
+                shared_state.exit_gracefully.set()
         except KeyboardInterrupt:
             # Gracefully stop the observer if the script is interrupted
-            stop_process.set()
-
-        if shared_state.PIVJLPATH:
-            # terminate running quickPIV processes
-            if piv_process.is_alive():
-                piv_process.terminate()
+            shared_state.exit_gracefully.set()
 
         # save PIV data to csv
         if shared_state.avg_speed_data:
@@ -1168,8 +1118,9 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                 or process_z_projections
                 or shared_state.exit_gracefully.is_set()):
             break
-    if thread.is_alive():
-        thread.join()
+    if shared_state.pivjl_script_path:
+        piv_process.join()
+    thread.join()
 
 
 def draw_napari_layer(projections_dict):
@@ -1249,29 +1200,29 @@ def merge_multiple_projections(wrapped_dict_list: tuple):
 
 def get_projections_dict_from_queue(shared_state: TimelapseSharedState):
 
-    if len(shared_state.PROJECTIONS_QUEUE) > 0:
+    if len(shared_state.projections_to_napari_dict) > 0:
         image_layer_dict = {}
         # store last 4 projections drawn in napari layer for merging channels purpose
-        if len(shared_state.DRAWN_PROJECTIONS_QUEUE) > 4:
-            shared_state.DRAWN_PROJECTIONS_QUEUE.popitem(last=False)
-        identifier, projections_dict_list = shared_state.PROJECTIONS_QUEUE.popitem(last=False)
+        if len(shared_state.shown_napari_layers_dict) > 4:
+            shared_state.shown_napari_layers_dict.popitem(last=False)
+        identifier, projections_dict_list = shared_state.projections_to_napari_dict.popitem(last=False)
         if MERGE_LIGHT_MODES:
             # should check the number of illuminations
             if len(projections_dict_list) == 2:
                 merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
                 image_layer_dict = draw_napari_layer(merged_projections_dict)
-            elif identifier in shared_state.DRAWN_PROJECTIONS_QUEUE and projections_dict_list:
-                projections_dict_list.extend(shared_state.DRAWN_PROJECTIONS_QUEUE[identifier])
+            elif identifier in shared_state.shown_napari_layers_dict and projections_dict_list:
+                projections_dict_list.extend(shared_state.shown_napari_layers_dict[identifier])
                 merged_projections_dict = merge_multiple_projections((identifier, projections_dict_list))
                 image_layer_dict = draw_napari_layer(merged_projections_dict)
-                del shared_state.DRAWN_PROJECTIONS_QUEUE[identifier]
+                del shared_state.shown_napari_layers_dict[identifier]
             elif projections_dict_list:
                 for wrapped_dict in projections_dict_list:
                     channel_layer = draw_napari_layer(wrapped_dict.projections)
                     for key, val in channel_layer.items():
                         image_layer_dict[(f"SPC_{wrapped_dict.specimen}_TP_{wrapped_dict.time_point}_{key}"
                                           f"_ILL_{wrapped_dict.illumination}")] = val
-                shared_state.DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
+                shared_state.shown_napari_layers_dict[identifier] = list(projections_dict_list)
         else:
             if projections_dict_list:
                 # iterate through the list, assign illumination index to the axis, save all to the new ,
@@ -1281,7 +1232,7 @@ def get_projections_dict_from_queue(shared_state: TimelapseSharedState):
                     for key, val in channel_layer.items():
                         image_layer_dict[(f"SPC_{wrapped_dict.specimen}_TP_{wrapped_dict.time_point}_{key}"
                                           f"_ILL_{wrapped_dict.illumination}")] = val
-                shared_state.DRAWN_PROJECTIONS_QUEUE[identifier] = list(projections_dict_list)
+                shared_state.shown_napari_layers_dict[identifier] = list(projections_dict_list)
             else:
                 logging_broadcast("Empty projections dictionary")
         if image_layer_dict:
@@ -1330,18 +1281,17 @@ def make_napari_viewer():
 
 
 def run_piv_process(shared_state: TimelapseSharedState,
-                    stop_event: Event,
                     save_merged_illumination: bool,
                     output_dir: str,
                     fix_drift: bool,
                     crop_margin: int,
                     ):
     from juliacall import Main as jl
-    jl.include(shared_state.PIVJLPATH)
+    jl.include(shared_state.pivjl_script_path)
     piv_projection_queue, projections_to_process, ts_dict = {}, {}, {}
     # queue_number corresponds to the specimen index from JSON config file or
     # to the SPC_ value in plane name if we process collected z-projections
-    for queue_number, _ in shared_state.shared_queues_of_z_projections.items():
+    for queue_number, _ in shared_state.maxprojection_queues_dict.items():
         piv_projection_queue[queue_number] = Queue()
         projections_to_process[queue_number] = Queue()
         ts_dict[queue_number] = PivTimeSeries(x=[], y=[], t=0, peak=[])
@@ -1352,12 +1302,14 @@ def run_piv_process(shared_state: TimelapseSharedState,
         writer = csv.writer(file)
         if file.tell() == 0:
             writer.writerow(['time_point', 'specimen', 'avg_speed', 'peak'])
-        while True:
-            for queue_number, queue_in in shared_state.shared_queues_of_z_projections.items():
+        while not shared_state.exit_gracefully.is_set():
+            for queue_number, queue_in in shared_state.maxprojection_queues_dict.items():
+                if shared_state.exit_gracefully.is_set():
+                    break
                 logging_broadcast(f"piv heartbeat #{queue_number}")
                 start_time = time.time()
                 try:
-                    plane_matrix = shared_state.shared_queues_of_z_projections[queue_number].get(timeout=0.05)
+                    plane_matrix = shared_state.maxprojection_queues_dict[queue_number].get(timeout=0.05)
                 except Exception as err:
                     continue
                 if plane_matrix:
@@ -1449,7 +1401,6 @@ def run_piv_process(shared_state: TimelapseSharedState,
                         if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
                             ts_dict[queue_number].x = ts_dict[queue_number].x[-PLT_WIDGET_X_AXIS_LENGTH::]
                             ts_dict[queue_number].y = ts_dict[queue_number].y[-PLT_WIDGET_X_AXIS_LENGTH::]
-                            # ts_dict[queue_number].peak = ts_dict[queue_number].peak[-PLT_WIDGET_X_AXIS_LENGTH::]
                         try:
                             peaks, _ = find_peaks(np.asarray(ts_dict[queue_number].y), prominence=1.5)
                         except Exception as error:
@@ -1465,16 +1416,9 @@ def run_piv_process(shared_state: TimelapseSharedState,
                                                             + 1 for x in x_marker]
                                 else:
                                     global_peaks_indices = x_marker
-                                # if ts_dict[queue_number].t in global_peaks_indices:
-                                #     ts_dict[queue_number].peak = True
-                                #     migration_detected.put(f"{ts_dict[queue_number].t}, specimen {queue_number}")
                                 for frame in global_peaks_indices:
                                     if frame not in migration_event_frame:
                                         migration_event_frame.add(frame)
-                                        print(f"{ts_dict[queue_number].t} - time, {x_marker} - x_marker, {global_peaks_indices} - global_peaks, "
-                                              f"{ts_dict[queue_number].peak} - peak list, {frame} frame")
-                                        shared_state.migration_detected.put(f"{frame}, specimen {queue_number}")
-                                        # ts_dict[queue_number].peak[frame] = True
                             except Exception as error:
                                 raise error
 
@@ -1483,7 +1427,7 @@ def run_piv_process(shared_state: TimelapseSharedState,
                                          avg_speed,
                                          False])
                         file.flush()
-                        shared_state.PIV_OUTPUT.put(
+                        shared_state.quick_piv_output_queue.put(
                             (queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
                         logging_broadcast(f"plane from queue #{queue_number} was processed")
                     else:
@@ -1494,8 +1438,8 @@ def run_piv_process(shared_state: TimelapseSharedState,
 
 def update_avg_speed_plot_windows(shared_state: TimelapseSharedState):
     # global PIV_OUTPUT
-    if shared_state.PIV_OUTPUT.qsize() > 0:
-        index, x, y, x_marker, y_marker = shared_state.PIV_OUTPUT.get()
+    if shared_state.quick_piv_output_queue.qsize() > 0:
+        index, x, y, x_marker, y_marker = shared_state.quick_piv_output_queue.get()
         try:
             PLT_WIDGETS_DICT[index].plot_curve(x, y, x_marker, y_marker)
         except KeyError:
@@ -1513,17 +1457,17 @@ def update_plotting_windows(shared_state: TimelapseSharedState):
                 window.close()
             plotting_windows_timer.stop()
 
-    if shared_state.PLOTTING_WINDOW_CREATED:
+    if shared_state.plotting_window_created:
         return
-    if shared_state.PIVJLPATH:
+    if shared_state.pivjl_script_path:
         if len(PLT_WIDGETS_DICT) > 0:
             # delete window from previous lapse
             PLT_WIDGETS_DICT = {}
-        if len(shared_state.SPECIMENS_QUANTITY):
-            for i in shared_state.SPECIMENS_QUANTITY:
+        if len(shared_state.specimens_indices_list):
+            for i in shared_state.specimens_indices_list:
                 PLT_WIDGETS_DICT[i] = PlottingWindow(i)
                 PLT_WIDGETS_DICT[i].show()
-            shared_state.PLOTTING_WINDOW_CREATED = True
+            shared_state.plotting_window_created = True
 
 
 def parse_message_from_microscope(message, exit_gracefully: threading.Event):
@@ -1613,9 +1557,9 @@ def correct_argv(argv):
     return corrected_argv
 
 
-def close_napari_viewer(shared_state: TimelapseSharedState):
+def close_napari_viewer(shared_state: TimelapseSharedState, napari_viewer):
     if shared_state.exit_gracefully.is_set():
-        VIEWER.close()
+        napari_viewer.close()
 
 
 def main():
@@ -1673,7 +1617,6 @@ def main():
     # event to stop the script gracefully
     # exit_gracefully = threading.Event()
     # Parse the command-line arguments
-    global VIEWER
     corrected_args = correct_argv(sys.argv)
     args = parser.parse_args(corrected_args[1:])
     if args.temp_dir is None:
@@ -1691,7 +1634,6 @@ def main():
                     shutil.rmtree(file_path)
             except Exception as e:
                 logging_broadcast(e)
-    # global VIEWER, PLT_WIDGETS_DICT, plotting_windows_timer
     global plotting_windows_timer
     if args.restart:
         global ACQUISITION_METADATA_FILE_TO_PROCESS
@@ -1710,21 +1652,19 @@ def main():
         heartbeat_thread.start()
     except Exception as e:
         logging_broadcast(f"{args},\n {e}")
-
-    # crop_mask_coordinates = manager.dict()
     thread = Thread(target=run_the_loop, args=(vars(args), shared_state, manager))
     thread.start()
-    VIEWER = make_napari_viewer()
+    napari_viewer = make_napari_viewer()
     timer1 = QTimer()
     timer1.timeout.connect(lambda: update_avg_speed_plot_windows(shared_state))
     timer1.start(25)
     timer2 = QTimer()
-    timer2.timeout.connect(lambda: update_napari_viewer_layer(shared_state))
+    timer2.timeout.connect(lambda: update_napari_viewer_layer(shared_state, napari_viewer))
     timer2.start(10)
     plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(shared_state))
     plotting_windows_timer.start(1000)
     timer4 = QTimer()
-    timer4.timeout.connect(lambda: close_napari_viewer(shared_state))
+    timer4.timeout.connect(lambda: close_napari_viewer(shared_state, napari_viewer))
     timer4.start(1000)
     napari.run()
     logging_broadcast(f"Napari viewer windows was closed, terminating child processes")
