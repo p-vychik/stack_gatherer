@@ -28,6 +28,7 @@ from PIL import Image
 import asyncio
 from watchfiles import awatch
 from threading import Thread
+import queue
 from queue import Queue
 from collections import OrderedDict
 from qtpy.QtWidgets import QCheckBox
@@ -136,10 +137,10 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
 
 
 class TimelapseSharedState:
-    def __init__(self, manager):
+    def __init__(self, manager, args):
         self.crop_mask_coordinates = manager.dict()
         self.json_config = manager.dict()
-        self.maxprojection_queues_dict = manager.dict()
+        self.maxprojection_queues_dict = manager.dict() if args.pivjl else None  # we use it only for quickPIV
         self.migration_detected = manager.Queue()
         self.avg_speed_data = manager.list()
         self.active_stacks = {}
@@ -167,6 +168,24 @@ class TimelapseSharedState:
         self.specimens_indices_list.extend(sorted(specimen_indices))
         for index in specimen_indices:
             self.maxprojection_queues_dict[index] = manager.Queue()
+
+    def print_attributes_content_size(self):
+        # function to test class attributes size in case of excessive memory use
+        for attr_name, attr_value in self.__dict__.items():
+            # Check if the attribute is a manager.Queue (using the general Queue type)
+            if isinstance(attr_value, multiprocessing.queues.Queue):
+                print(f"Attribute: {attr_name}, Type: Queue (proxy), Size: Cannot determine size")
+
+            # Check if the attribute is a manager.list (using ListProxy for managed lists)
+            elif isinstance(attr_value, list) or hasattr(attr_value, '__len__'):  # manager.list proxies have len()
+                print(f"Attribute: {attr_name}, Type: List (proxy), Size: {len(attr_value)}")
+
+            # Special handling for maxprojection_queues_dict
+            elif attr_name == "maxprojection_queues_dict" and isinstance(attr_value, dict):
+                print(f"Attribute: {attr_name}, Type: Dict of Queues (proxy), Number of Queues: {len(attr_value)}")
+                for key, queue in attr_value.items():
+                    if isinstance(queue, multiprocessing.queues.Queue):
+                        print(f"  Queue for Key: {key}, Size: Cannot determine size")
 
 
 class NotImagePlaneFile(Exception):
@@ -641,7 +660,6 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
                                 output_dir,
                                 factor=1,
                                 axes=""):
-
     if os.path.isdir(file_path):
         return
     # load json parameters
@@ -659,7 +677,8 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
         shared_state.json_config.update(dict.fromkeys(list_of_stack_signatures, metadata_json))
         # get specimens quantity
         try:
-            shared_state.specimens_indices_list = [specimen_dict['userDefinedIndex'] for specimen_dict in metadata_json['specimens']]
+            shared_state.specimens_indices_list = [specimen_dict['userDefinedIndex'] for specimen_dict in
+                                                   metadata_json['specimens']]
             shared_state.specimen_indices_loaded = True
         except Exception as err:
             logging_broadcast(f"Failed to set specimen quantity {err}")
@@ -902,28 +921,39 @@ async def read_input_files(shared_state,
                            input_folder,
                            output_dir,
                            factor,
-                           axes):
+                           axes,
+                           input_files_queue):
     try:
-        async for changes in awatch(input_folder):
-            if shared_state.exit_gracefully.is_set():
-                break
-            paths = []
-            for change in changes:
-                event, file_path = change
-                if event.value == 1:
-                    paths.append(file_path)
-            if paths:
-                paths.sort()
-                for path in paths:
-                    try:
-                        load_file_from_input_folder(shared_state,
-                                                    manager,
-                                                    path,
-                                                    output_dir,
-                                                    factor,
-                                                    axes)
-                    except Exception as err:
-                        logging_broadcast(f"Error processing file {path}: {err}")
+        # Create an asynchronous generator from awatch
+        async_gen = awatch(input_folder)
+        while True:
+            try:
+                # Set a short timeout for the next value from the async generator
+                changes = await asyncio.wait_for(async_gen.__anext__(), timeout=1)
+                # Process changes if any
+                paths = []
+                for change in changes:
+                    if shared_state.exit_gracefully.is_set():
+                        break
+                    event, file_path = change
+                    if event.value == 1:  # File created
+                        paths.append(file_path)
+
+                if paths:
+                    paths.sort()
+                    for path in paths:
+                        try:
+                            input_files_queue.put(path)
+                        except Exception as err:
+                            logging_broadcast(f"Error processing file {path}: {err}")
+            except asyncio.TimeoutError:
+                # During timeout, check if the exit Event is set
+                if shared_state.exit_gracefully.is_set():
+                    break
+            except StopAsyncIteration:
+                async_gen = awatch(input_folder)
+                continue
+
     except Exception as err:
         shared_state.exit_gracefully.set()
         logging_broadcast(f"read_input_files {err}")
@@ -934,9 +964,35 @@ def watchfiles_thread(*args):
     logging_broadcast("watchfiles finished")
 
 
-# def run_the_loop(kwargs, exit_gracefully: threading.Event, manager, crop_mask_coordinates):
-def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
+def processing_input_files_thread(shared_state: TimelapseSharedState,
+                                  file_path_queue,
+                                  manager,
+                                  input_dir,
+                                  output_dir,
+                                  factor,
+                                  axes):
+    next_check = time.time() + 30
+    content = os.scandir(input_dir)
+    while not shared_state.exit_gracefully.is_set():
+        try:
+            if time.time() - next_check <= 0:
+                content = os.scandir(input_dir)
+                next_check = time.time() + 30
+            if content:
+                file_paths = [os.path.join(input_dir, f) for f in content]
+                for path in file_paths:
+                    load_file_from_input_folder(shared_state, manager, path, output_dir, factor, axes)
+                content = []
+            # Get file path from queue (block until an item is available)
+            path = file_path_queue.get(timeout=1)
+            load_file_from_input_folder(shared_state, manager, path, output_dir, factor, axes)
+        except queue.Empty:
+            continue
+        except Exception as err:
+            logging_broadcast(f"Error processing file from queue: {err}")
 
+
+def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
     input_dir = kwargs.get("input")
     output_dir = kwargs.get("output")
     axes = kwargs.get("axes", "Z")
@@ -951,16 +1007,25 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
 
     # Start the input directory observer
     logging_broadcast(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
+    # queue for input_data
+    plane_files_queue = Queue()
+
     thread = Thread(target=watchfiles_thread, args=(shared_state,
                                                     manager,
                                                     input_dir,
                                                     output_dir,
                                                     factor,
-                                                    axes),
-                    daemon=False
+                                                    axes,
+                                                    plane_files_queue),
+                    daemon=True
                     )
+    thread2 = Thread(target=processing_input_files_thread,
+                     args=(shared_state, plane_files_queue, manager, input_dir, output_dir, factor, axes),
+                     daemon=True
+                     )
     if not process_z_projections:
         thread.start()
+        thread2.start()
 
     while True:
         # RESET avg_speed_data and migration_detected for shared_state object!
@@ -970,6 +1035,8 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                    and not process_z_projections
                    and not shared_state.exit_gracefully.is_set()):
                 time.sleep(1)
+                if shared_state.exit_gracefully.is_set():
+                    break
             if process_z_projections:
                 specimen_indices = set()
                 for f in os.listdir(input_dir):
@@ -998,7 +1065,7 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                                               fix_drift,
                                               crop_margin
                                               ),
-                name='piv_run', )
+                name='piv_run', daemon=True)
             piv_process.start()
             # mode to process only max projections
             if process_z_projections:
@@ -1026,7 +1093,8 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                                 shared_state.projections_to_napari_dict[wrapped_z_projection.identifier] = \
                                     [wrapped_z_projection]
                             else:
-                                shared_state.projections_to_napari_dict[wrapped_z_projection.identifier].append(wrapped_z_projection)
+                                shared_state.projections_to_napari_dict[wrapped_z_projection.identifier].append(
+                                    wrapped_z_projection)
                             images_dict = get_projections_dict_from_queue(shared_state)
                             if images_dict:
                                 shared_state.napari_layers_to_show_queue.put(images_dict)
@@ -1064,6 +1132,10 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                             break
                         check_next = time.time() + 60
                         speed_list_length = len(shared_state.avg_speed_data)
+                # for tests only
+                # if check_next - time.time() <= 0:
+                #     shared_state.print_attributes_content_size()
+                #     check_next = time.time() + 60
                 # Sleep to keep the script running
                 time.sleep(1)
             if shared_state.pivjl_script_path:
@@ -1120,7 +1192,9 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
             break
     if shared_state.pivjl_script_path:
         piv_process.join()
-    thread.join()
+    if not process_z_projections:
+        thread2.join()
+        thread.join()
 
 
 def draw_napari_layer(projections_dict):
@@ -1199,7 +1273,6 @@ def merge_multiple_projections(wrapped_dict_list: tuple):
 
 
 def get_projections_dict_from_queue(shared_state: TimelapseSharedState):
-
     if len(shared_state.projections_to_napari_dict) > 0:
         image_layer_dict = {}
         # store last 4 projections drawn in napari layer for merging channels purpose
@@ -1232,7 +1305,7 @@ def get_projections_dict_from_queue(shared_state: TimelapseSharedState):
                     for key, val in channel_layer.items():
                         image_layer_dict[(f"SPC_{wrapped_dict.specimen}_TP_{wrapped_dict.time_point}_{key}"
                                           f"_ILL_{wrapped_dict.illumination}")] = val
-                shared_state.shown_napari_layers_dict[identifier] = list(projections_dict_list)
+                # shared_state.shown_napari_layers_dict[identifier] = list(projections_dict_list)
             else:
                 logging_broadcast("Empty projections dictionary")
         if image_layer_dict:
@@ -1303,10 +1376,10 @@ def run_piv_process(shared_state: TimelapseSharedState,
         if file.tell() == 0:
             writer.writerow(['time_point', 'specimen', 'avg_speed', 'peak'])
         while not shared_state.exit_gracefully.is_set():
-            for queue_number, queue_in in shared_state.maxprojection_queues_dict.items():
+            for queue_number, queue_in in shared_state.maxshared_state.maxprojection_queues_dict.items():
                 if shared_state.exit_gracefully.is_set():
                     break
-                logging_broadcast(f"piv heartbeat #{queue_number}")
+                # logging_broadcast(f"piv heartbeat #{queue_number}")
                 start_time = time.time()
                 try:
                     plane_matrix = shared_state.maxprojection_queues_dict[queue_number].get(timeout=0.05)
@@ -1432,7 +1505,7 @@ def run_piv_process(shared_state: TimelapseSharedState,
                         logging_broadcast(f"plane from queue #{queue_number} was processed")
                     else:
                         raise ValueError("Projections should have the same size for QuickPIV input")
-                logging_broadcast(f"for specimen #{queue_number} run took {time.time()-start_time}")
+                logging_broadcast(f"for specimen #{queue_number} run took {time.time() - start_time}")
             time.sleep(0.1)
 
 
@@ -1645,14 +1718,15 @@ def main():
     # debugpy.wait_for_client()  # Blocks execution until client is attached
     heartbeat_thread = None
     manager = Manager()
-    shared_state = TimelapseSharedState(manager)
+    shared_state = TimelapseSharedState(manager, args)
+
     try:
         heartbeat_thread = threading.Thread(
-            target=heartbeat_and_command_handler, args=(args.port, shared_state))
+            target=heartbeat_and_command_handler, args=(args.port, shared_state), daemon=True)
         heartbeat_thread.start()
     except Exception as e:
         logging_broadcast(f"{args},\n {e}")
-    thread = Thread(target=run_the_loop, args=(vars(args), shared_state, manager))
+    thread = Thread(target=run_the_loop, args=(vars(args), shared_state, manager), daemon=True)
     thread.start()
     napari_viewer = make_napari_viewer()
     timer1 = QTimer()
@@ -1672,7 +1746,6 @@ def main():
     thread.join()
     if heartbeat_thread is not None:
         heartbeat_thread.join()
-    del shared_state
     logging_broadcast(f"stack_gatherer stopped")
 
 
