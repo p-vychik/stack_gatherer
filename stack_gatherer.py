@@ -138,6 +138,7 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
 
 class TimelapseSharedState:
     def __init__(self, manager, args):
+        self.args = args
         self.crop_mask_coordinates = manager.dict()
         self.json_config = manager.dict()
         self.maxprojection_queues_dict = manager.dict() if args.pivjl else None  # we use it only for quickPIV
@@ -156,6 +157,7 @@ class TimelapseSharedState:
         self.plotting_window_created = False
         self.temp_dir = ""
         self.pivjl_script_path = ""
+        self.restart_timelapse_json = self.args.restart if self.args.restart else ""
 
     def update_piv_queues(self, manager):
         if len(self.maxprojection_queues_dict) == 0:
@@ -895,7 +897,7 @@ def find_config_files_locations(config_files_locations: dict,
 
     # If json_file_name is not provided, collect lapse ID from planes present in the folder and continue
     # with search in input and output folders
-    content = os.listdir(input_folder)
+    content = list(os.listdir(input_folder))
     if len(content) == 0:
         logging_broadcast(f"input directory doesn't contain images or config files")
         return
@@ -971,12 +973,22 @@ def processing_input_files_thread(shared_state: TimelapseSharedState,
                                   output_dir,
                                   factor,
                                   axes):
-    next_check = time.time() + 30
-    content = os.scandir(input_dir)
+
+    next_check = time.time()
+    content = list(os.scandir(input_dir))
+    if shared_state.restart_timelapse_json:
+        json_paths_dict = {}
+        find_config_files_locations(json_paths_dict,
+                                    output_dir, input_dir,
+                                    shared_state.restart_timelapse_json)
+        if len(json_paths_dict):
+            for _, json_file in json_paths_dict.items():
+                load_file_from_input_folder(shared_state, manager, json_file.path, output_dir, factor, axes)
+
     while not shared_state.exit_gracefully.is_set():
         try:
             if time.time() - next_check <= 0:
-                content = os.scandir(input_dir)
+                content = list(os.scandir(input_dir))
                 next_check = time.time() + 30
             if content:
                 file_paths = [os.path.join(input_dir, f) for f in content]
@@ -1376,7 +1388,7 @@ def run_piv_process(shared_state: TimelapseSharedState,
         if file.tell() == 0:
             writer.writerow(['time_point', 'specimen', 'avg_speed', 'peak'])
         while not shared_state.exit_gracefully.is_set():
-            for queue_number, queue_in in shared_state.maxshared_state.maxprojection_queues_dict.items():
+            for queue_number, queue_in in shared_state.maxprojection_queues_dict.items():
                 if shared_state.exit_gracefully.is_set():
                     break
                 # logging_broadcast(f"piv heartbeat #{queue_number}")
