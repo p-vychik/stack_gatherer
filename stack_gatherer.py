@@ -194,6 +194,27 @@ class NotImagePlaneFile(Exception):
     pass
 
 
+class InputFilesQueue:
+    def __init__(self):
+        self.queue = Queue()
+        self.loaded_files = set()
+
+    def is_file_loaded(self, path):
+        return path in self.loaded_files
+
+    def put(self, path):
+        self.queue.put(path)
+        self.loaded_files.add(path)
+
+    def get(self):
+        try:
+            path = self.queue.get(timeout=1)
+            self.loaded_files.discard(path)
+            return path
+        except queue.Empty:
+            return None
+
+
 @dataclass
 class StackSignature:
     total_num_planes: int
@@ -600,6 +621,7 @@ def check_stack_and_collect_if_ready(shared_state: TimelapseSharedState,
         for i, _ in enumerate(shared_state.active_stacks[stack_signature.signature]):
             # We have to access by index since we can't guarantee that files were added to dict in order of planes
             file_list.append(shared_state.active_stacks[stack_signature.signature][i].get_file_path())
+        file_list.sort()
         sample_file_obj = ImageFile(file_list[0])
         sample_file_obj.extension = "tif"
         stack_path = os.path.join(output_dir, sample_file_obj.get_stack_name())
@@ -686,7 +708,6 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
             logging_broadcast(f"Failed to set specimen quantity {err}")
         if len(shared_state.specimens_indices_list) and shared_state.maxprojection_queues_dict is not None:
             shared_state.update_piv_queues(manager)
-
         shared_state.plotting_window_created = False
 
         try:
@@ -695,9 +716,13 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
                     shutil.move(file_path, destination_folder)
                 except Exception as err:
                     logging_broadcast(f"Attempt to move {file_path} reulted in {err}")
+            elif os.path.join(destination_folder, os.path.basename(file_path)) == file_path:
+                # the JSON config was taken from the output folder after stack_gatherer was restarted
+                # no need to remove the config file for possible restarting calls later
+                pass
             else:
-                logging_broadcast(f"file {os.path.basename(file_path)} exists in"
-                                  f"  {os.path.join(destination_folder, os.path.basename(file_path))}, "
+                logging_broadcast(f"file {os.path.basename(file_path)} exists in "
+                                  f"{os.path.join(destination_folder, os.path.basename(file_path))}, "
                                   f"so it would be removed")
                 try:
                     os.remove(file_path)
@@ -744,7 +769,7 @@ def extract_and_display_selection(shape_layer, min_coords, max_coords, shared_st
         else:
             logging_broadcast("Can't save cropping mask into the shared dictionary, key index is not present!")
     except Exception as err:
-        logging_broadcast(f"Exception extract_and_display: {err}")
+        logging_broadcast(f"Exception extract_and_display_selection: {err}")
 
 
 def on_rectangle_selection(shapes_layer, event, shared_state: TimelapseSharedState):
@@ -830,6 +855,7 @@ def get_lapse_id(file_name):
             return base_name.split("_SPC")[0].split("timelapseID-")[1]
         else:
             logging_broadcast(f"get_lapse_id failed to parse {file_name} for timelapseID")
+            return ""
     except IndexError:
         logging_broadcast(f"IndexError: get_lapse_id failed to parse {file_name} for timelapseID")
         return ""
@@ -924,7 +950,8 @@ async def read_input_files(shared_state,
                            output_dir,
                            factor,
                            axes,
-                           input_files_queue):
+                           input_files_queue: InputFilesQueue,
+                           lock: threading.Lock):
     try:
         # Create an asynchronous generator from awatch
         async_gen = awatch(input_folder)
@@ -942,10 +969,12 @@ async def read_input_files(shared_state,
                         paths.append(file_path)
 
                 if paths:
-                    paths.sort()
                     for path in paths:
                         try:
-                            input_files_queue.put(path)
+                            with lock:
+                                if input_files_queue.is_file_loaded(path):
+                                    continue
+                                input_files_queue.put(path)
                         except Exception as err:
                             logging_broadcast(f"Error processing file {path}: {err}")
             except asyncio.TimeoutError:
@@ -967,15 +996,14 @@ def watchfiles_thread(*args):
 
 
 def processing_input_files_thread(shared_state: TimelapseSharedState,
-                                  file_path_queue,
+                                  file_path_queue: InputFilesQueue,
                                   manager,
                                   input_dir,
                                   output_dir,
                                   factor,
-                                  axes):
+                                  axes,
+                                  lock: threading.Lock):
 
-    next_check = time.time()
-    content = list(os.scandir(input_dir))
     if shared_state.restart_timelapse_json:
         json_paths_dict = {}
         find_config_files_locations(json_paths_dict,
@@ -984,28 +1012,44 @@ def processing_input_files_thread(shared_state: TimelapseSharedState,
         if len(json_paths_dict):
             for _, json_file in json_paths_dict.items():
                 load_file_from_input_folder(shared_state, manager, json_file.path, output_dir, factor, axes)
+    next_check = time.time()
 
     while not shared_state.exit_gracefully.is_set():
         try:
-            if time.time() - next_check <= 0:
+            if next_check - time.time() <= 0:
+                # check input directory content every 10 seconds and load files to the active_stacks
                 content = list(os.scandir(input_dir))
-                next_check = time.time() + 30
+                next_check = time.time() + 10
             if content:
-                file_paths = [os.path.join(input_dir, f) for f in content]
-                for path in file_paths:
-                    load_file_from_input_folder(shared_state, manager, path, output_dir, factor, axes)
+                for f in content:
+                    # locking file_path_queue prevents addtion of duplicate files to the queue
+                    # in read_input_files thread
+                    with lock:
+                        if file_path_queue.is_file_loaded(f.path):
+                            continue
+                        file_path_queue.put(f.path)
+
                 content = []
-            # Get file path from queue (block until an item is available)
-            path = file_path_queue.get(timeout=1)
-            load_file_from_input_folder(shared_state, manager, path, output_dir, factor, axes)
-        except queue.Empty:
-            continue
+            paths = []
+            with lock:
+                # deque while locked and process the files
+                path = file_path_queue.get()
+                while path:
+                    # config JSON files should always be processed first
+                    if path.upper().endswith("JSON"):
+                        paths.insert(0, path)
+                    else:
+                        paths.append(path)
+                    path = file_path_queue.get()
+            if paths:
+                for path in paths:
+                    load_file_from_input_folder(shared_state, manager, path, output_dir, factor, axes)
         except Exception as err:
             logging_broadcast(f"Error processing file from queue: {err}")
 
 
 def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
-    input_dir = kwargs.get("input")
+    input_dir = kwargs.get("input", None)
     output_dir = kwargs.get("output")
     axes = kwargs.get("axes", "Z")
     factor = kwargs.get("factor_anisotropy", None)
@@ -1017,22 +1061,33 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
     fix_drift = kwargs.get("correct_drift", False)
     crop_margin = kwargs.get("margin_crop", 100)
 
+    if not os.path.exists(input_dir) or not os.path.exists(output_dir):
+        logging_broadcast(f"Output or Input folder doesn't exist")
+        sys.exit(1)
     # Start the input directory observer
     logging_broadcast(f"Watching {input_dir} for images, and saving stacks to {output_dir}")
     # queue for input_data
-    plane_files_queue = Queue()
-
+    plane_files_queue = InputFilesQueue()
+    stop_file = os.path.join(input_dir, STOP_FILE_NAME)
+    read_input_dir_lock = threading.Lock()
     thread = Thread(target=watchfiles_thread, args=(shared_state,
                                                     manager,
                                                     input_dir,
                                                     output_dir,
                                                     factor,
                                                     axes,
-                                                    plane_files_queue),
+                                                    plane_files_queue,
+                                                    read_input_dir_lock),
                     daemon=True
                     )
     thread2 = Thread(target=processing_input_files_thread,
-                     args=(shared_state, plane_files_queue, manager, input_dir, output_dir, factor, axes),
+                     args=(shared_state,
+                           plane_files_queue,
+                           manager, input_dir,
+                           output_dir,
+                           factor,
+                           axes,
+                           read_input_dir_lock),
                      daemon=True
                      )
     if not process_z_projections:
@@ -1117,7 +1172,6 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                 logging_broadcast(f"Finished with uploading projection files for quickPIV")
 
         try:
-            stop_file = os.path.join(input_dir, STOP_FILE_NAME)
             check_next = time.time() + 60
             speed_list_length = len(shared_state.avg_speed_data)
             while (not os.path.exists(stop_file)
@@ -1532,7 +1586,6 @@ def update_avg_speed_plot_windows(shared_state: TimelapseSharedState):
 
 
 def update_plotting_windows(shared_state: TimelapseSharedState):
-    # global PLOTTING_WINDOW_CREATED
     global PLT_WIDGETS_DICT
     global plotting_windows_timer
 
