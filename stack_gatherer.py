@@ -36,7 +36,8 @@ from dataclasses import dataclass, field
 from typing import List
 from typing import Union
 from datetime import datetime
-from multiprocessing import Manager
+from multiprocessing import Manager, Process, Pipe
+from quickPIV_call import compute_avg_speed
 import zmq
 from PlottingWindow import Ui_MainWindow
 from PyQt5.QtCore import QTimer
@@ -139,55 +140,51 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
 class TimelapseSharedState:
     def __init__(self, manager, args):
         self.args = args
-        self.crop_mask_coordinates = manager.dict()
-        self.json_config = manager.dict()
-        self.maxprojection_queues_dict = manager.dict() if args.pivjl else None  # we use it only for quickPIV
-        self.migration_detected = manager.Queue()
-        self.avg_speed_data = manager.list()
+        self.crop_mask_coordinates = dict()
+        self.json_config = dict()
+        self.maxprojection_queue = Queue() if args.pivjl else None  # we use it only for quickPIV
+        self.migration_detected = Queue()
+        self.avg_speed_data = list()
         self.active_stacks = {}
-        self.currently_saving_stacks_dict = manager.dict()
+        self.currently_saving_stacks_dict = dict()
         self.currently_saving_stacks_lock = multiprocessing.Lock()
         self.exit_gracefully = multiprocessing.Event()
-        self.napari_layers_to_show_queue = manager.Queue()
-        self.quick_piv_output_queue = manager.Queue()
+        self.napari_layers_to_show_queue = Queue()
+        self.quick_piv_output_queue = Queue()
         self.projections_to_napari_dict = OrderedDict()
         self.shown_napari_layers_dict = OrderedDict()
         self.specimen_indices_loaded = False
-        self.specimens_indices_list = manager.list()
+        self.specimens_indices_list = list()
         self.plotting_window_created = False
         self.temp_dir = ""
         self.pivjl_script_path = ""
         self.restart_timelapse_json = self.args.restart if self.args.restart else ""
 
     def update_piv_queues(self, manager):
-        if len(self.maxprojection_queues_dict) == 0:
+        if self.maxprojection_queue.qsize() == 0:
             for i in self.specimens_indices_list:
-                self.maxprojection_queues_dict[i] = manager.Queue()
-                self.crop_mask_coordinates[i] = manager.list()
-            logging_broadcast(f"quickPIV queue was updated")
+                self.maxprojection_queue = Queue()
+                self.crop_mask_coordinates[i] = list()
+            logging_broadcast(f"quickPIV queues was updated")
 
     def reset_shared_queues(self, specimen_indices, manager):
         self.specimens_indices_list.extend(sorted(specimen_indices))
-        for index in specimen_indices:
-            self.maxprojection_queues_dict[index] = manager.Queue()
+        self.maxprojection_queue = Queue()
 
     def print_attributes_content_size(self):
         # function to test class attributes size in case of excessive memory use
         for attr_name, attr_value in self.__dict__.items():
             # Check if the attribute is a manager.Queue (using the general Queue type)
-            if isinstance(attr_value, multiprocessing.queues.Queue):
-                print(f"Attribute: {attr_name}, Type: Queue (proxy), Size: Cannot determine size")
+            if isinstance(attr_value, Queue):
+                print(f"Attribute: {attr_name}, Type: Queue, Size: {attr_value.qsize()}")
 
             # Check if the attribute is a manager.list (using ListProxy for managed lists)
-            elif isinstance(attr_value, list) or hasattr(attr_value, '__len__'):  # manager.list proxies have len()
+            elif isinstance(attr_value, list) or hasattr(attr_value, '__len__'):
                 print(f"Attribute: {attr_name}, Type: List (proxy), Size: {len(attr_value)}")
 
             # Special handling for maxprojection_queues_dict
-            elif attr_name == "maxprojection_queues_dict" and isinstance(attr_value, dict):
-                print(f"Attribute: {attr_name}, Type: Dict of Queues (proxy), Number of Queues: {len(attr_value)}")
-                for key, queue in attr_value.items():
-                    if isinstance(queue, multiprocessing.queues.Queue):
-                        print(f"  Queue for Key: {key}, Size: Cannot determine size")
+            elif attr_name == "maxprojection_queues_dict" and isinstance(attr_value, queue):
+                print(f"Attribute: {attr_name}, Type: Queue, size: {(attr_value.qsize())}")
 
 
 class NotImagePlaneFile(Exception):
@@ -542,7 +539,6 @@ def collect_files_to_one_stack_get_axial_projections(shared_state: TimelapseShar
                 continue
             zyx_stack[z] = read_image(file_list[z])
             projections = plane_to_projection(zyx_stack[z], projections)
-            # projections = plane_to_projection(zyx_stack[z], projections)
             pbar.update(1)
         zyx_stack.flush()
     if projections:
@@ -564,11 +560,13 @@ def collect_files_to_one_stack_get_axial_projections(shared_state: TimelapseShar
             # push to the queue for PIV calculations
             wrapped_z_projection = ProjectionsDictWrapper({"Z": projections["Z"]}, stack_signature)
             # here we should put the projection with clear identification of species and other parameters
-            if shared_state.maxprojection_queues_dict is not None:
-                if stack_signature.specimen in shared_state.maxprojection_queues_dict:
-                    shared_state.maxprojection_queues_dict[stack_signature.specimen].put(wrapped_z_projection)
-                else:
-                    logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
+            if shared_state.maxprojection_queue is not None:
+                # should add this option to check
+                # if stack_signature.specimen in shared_state.maxprojection_queue:
+                    # shared_state.maxprojection_queue[stack_signature.specimen].put(wrapped_z_projection)
+                shared_state.maxprojection_queue.put(wrapped_z_projection)
+                # else:
+                #     logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
         for axis in projections.keys():
             try:
                 if not os.path.exists(projections_files_path[axis]):
@@ -706,7 +704,7 @@ def load_file_from_input_folder(shared_state: TimelapseSharedState,
             shared_state.specimen_indices_loaded = True
         except Exception as err:
             logging_broadcast(f"Failed to set specimen quantity {err}")
-        if len(shared_state.specimens_indices_list) and shared_state.maxprojection_queues_dict is not None:
+        if len(shared_state.specimens_indices_list) and shared_state.maxprojection_queue is not None:
             shared_state.update_piv_queues(manager)
         shared_state.plotting_window_created = False
 
@@ -828,7 +826,6 @@ def update_napari_viewer_layer(shared_state: TimelapseSharedState, napari_viewer
                     # Restore the previous selection if it exists
                     if existing_selection:
                         layer_image.selected_data = [existing_selection]
-                    # layer_image.mouse_drag_callbacks.append(callback_wrapper)
                 # Adjust contrast limits if necessary
                 if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
                     napari_viewer.layers[axes_names].reset_contrast_limits()
@@ -1003,7 +1000,6 @@ def processing_input_files_thread(shared_state: TimelapseSharedState,
                                   factor,
                                   axes,
                                   lock: threading.Lock):
-
     if shared_state.restart_timelapse_json:
         json_paths_dict = {}
         find_config_files_locations(json_paths_dict,
@@ -1022,7 +1018,7 @@ def processing_input_files_thread(shared_state: TimelapseSharedState,
                 next_check = time.time() + 10
             if content:
                 for f in content:
-                    # locking file_path_queue prevents addtion of duplicate files to the queue
+                    # locking file_path_queue prevents addition of duplicates to the queue
                     # in read_input_files thread
                     with lock:
                         if file_path_queue.is_file_loaded(f.path):
@@ -1125,14 +1121,14 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                         token, chat_id = line.strip().split(" ")
                     except Exception as err:
                         logging_broadcast(err)
-            piv_process = multiprocessing.Process(
-                target=run_piv_process, args=(shared_state,
-                                              process_z_projections,
-                                              output_dir,
-                                              fix_drift,
-                                              crop_margin
-                                              ),
-                name='piv_run', daemon=True)
+            piv_process = Thread(target=run_piv_process,
+                                 args=(shared_state,
+                                      process_z_projections,
+                                      output_dir,
+                                      fix_drift,
+                                      crop_margin
+                                      ),
+                                name='piv_run', daemon=True)
             piv_process.start()
             # mode to process only max projections
             if process_z_projections:
@@ -1150,9 +1146,10 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                         stack_signature = img_metadata.get_stack_signature()
                         wrapped_z_projection = ProjectionsDictWrapper({"Z": img_data}, stack_signature)
                         # push projection to the queue for PIV calculations
-                        if stack_signature.specimen in shared_state.maxprojection_queues_dict:
+                        # change processing! maxprojection_queue is not a dictionary anymore
+                        if stack_signature.specimen in shared_state.maxprojection_queue:
                             while True:
-                                if shared_state.maxprojection_queues_dict[stack_signature.specimen].qsize() > 10:
+                                if shared_state.maxprojection_queue[stack_signature.specimen].qsize() > 10:
                                     time.sleep(1)
                                 else:
                                     break
@@ -1165,7 +1162,7 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                             images_dict = get_projections_dict_from_queue(shared_state)
                             if images_dict:
                                 shared_state.napari_layers_to_show_queue.put(images_dict)
-                            shared_state.maxprojection_queues_dict[stack_signature.specimen].put(wrapped_z_projection)
+                            shared_state.maxprojection_queue[stack_signature.specimen].put(wrapped_z_projection)
                         else:
                             logging_broadcast(f"Specimen index {stack_signature.specimen} was not found, check "
                                               f"if file name format follows the expected name pattern")
@@ -1198,10 +1195,6 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                             break
                         check_next = time.time() + 60
                         speed_list_length = len(shared_state.avg_speed_data)
-                # for tests only
-                # if check_next - time.time() <= 0:
-                #     shared_state.print_attributes_content_size()
-                #     check_next = time.time() + 60
                 # Sleep to keep the script running
                 time.sleep(1)
             if shared_state.pivjl_script_path:
@@ -1425,164 +1418,174 @@ def run_piv_process(shared_state: TimelapseSharedState,
                     fix_drift: bool,
                     crop_margin: int,
                     ):
-    from juliacall import Main as jl
-    jl.include(shared_state.pivjl_script_path)
+
+    parent_conn, child_conn = Pipe()
+
+    # Start the child process, passing child_conn
+    p = Process(target=compute_avg_speed, args=(child_conn,))
+    p.start()
+    parent_conn.send(shared_state.pivjl_script_path)
     piv_projection_queue, projections_to_process, ts_dict = {}, {}, {}
     # queue_number corresponds to the specimen index from JSON config file or
     # to the SPC_ value in plane name if we process collected z-projections
-    for queue_number, _ in shared_state.maxprojection_queues_dict.items():
+    for queue_number in shared_state.specimens_indices_list:
         piv_projection_queue[queue_number] = Queue()
         projections_to_process[queue_number] = Queue()
         ts_dict[queue_number] = PivTimeSeries(x=[], y=[], t=0, peak=[])
     migration_event_frame = set()
     logging_broadcast(f"quickPIV process started, PID: {os.getpid()}")
     csv_file = os.path.join(output_dir, f"piv_avg_speed_{datetime.now().strftime('%H_%M_%S')}.csv")
-    with open(csv_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        if file.tell() == 0:
-            writer.writerow(['time_point', 'specimen', 'avg_speed', 'peak'])
-        while not shared_state.exit_gracefully.is_set():
-            for queue_number, queue_in in shared_state.maxprojection_queues_dict.items():
-                if shared_state.exit_gracefully.is_set():
-                    break
-                # logging_broadcast(f"piv heartbeat #{queue_number}")
-                start_time = time.time()
+    # with open(csv_file, mode='a', newline='') as file:
+    #     writer = csv.writer(file)
+    #     if file.tell() == 0:
+    #         writer.writerow(['time_point', 'specimen', 'avg_speed', 'peak'])
+    while not shared_state.exit_gracefully.is_set():
+        if shared_state.exit_gracefully.is_set():
+            break
+        # logging_broadcast(f"piv heartbeat #{queue_number}")
+        start_time = time.time()
+        try:
+            plane_matrix = shared_state.maxprojection_queue.get(timeout=0.01)
+        except Exception as err:
+            continue
+        if plane_matrix:
+            queue_number = plane_matrix.specimen
+            projections_to_process[queue_number].put(plane_matrix)
+        else:
+            continue
+        if projections_to_process[queue_number].qsize() < 2:
+            continue
+        wrapped_z_p_1 = projections_to_process[queue_number].get()
+        # to calculate avg speed in consecutive way we store
+        # the last projection from every pairwise comparison
+        wrapped_z_p_2 = projections_to_process[queue_number].queue[0]
+        if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
+            merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
+                                                             (wrapped_z_p_1,
+                                                              wrapped_z_p_2))
+                                                            )
+            merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
+                                                         wrapped_z_p_2.signature)
+            if save_merged_illumination:
                 try:
-                    plane_matrix = shared_state.maxprojection_queues_dict[queue_number].get(timeout=0.05)
+                    file_name = file_name_merged_illumination_based_on_signature(
+                        wrapped_z_p_2.stack_signature)
+                    imwrite(os.path.join(output_dir, f"{file_name}.tif"),
+                            merged_wrapped_proj.projections["Z"])
                 except Exception as err:
-                    continue
-                if plane_matrix:
-                    projections_to_process[queue_number].put(plane_matrix)
-                if projections_to_process[queue_number].qsize() >= 2:
-                    wrapped_z_p_1 = projections_to_process[queue_number].get()
-                    # to calculate avg speed in consecutive way we store
-                    # the last projection from every pairwise comparison
-                    wrapped_z_p_2 = projections_to_process[queue_number].queue[0]
-                    if wrapped_z_p_1.identifier == wrapped_z_p_2.identifier:
-                        merged_projections = merge_multiple_projections((wrapped_z_p_1.identifier,
-                                                                         (wrapped_z_p_1,
-                                                                          wrapped_z_p_2))
-                                                                        )
-                        merged_wrapped_proj = ProjectionsDictWrapper(merged_projections,
-                                                                     wrapped_z_p_2.signature)
-                        if save_merged_illumination:
-                            try:
-                                file_name = file_name_merged_illumination_based_on_signature(
-                                    wrapped_z_p_2.stack_signature)
-                                imwrite(os.path.join(output_dir, f"{file_name}.tif"),
-                                        merged_wrapped_proj.projections["Z"])
-                            except Exception as err:
-                                shared_state.migration_detected.put(f"Failed to save the merged Z-projection, {err}")
-                        piv_projection_queue[queue_number].put(merged_wrapped_proj)
-                        projections_to_process[queue_number].get()
-                    else:
-                        piv_projection_queue[queue_number].put(wrapped_z_p_1)
+                    shared_state.migration_detected.put(f"Failed to save the merged Z-projection, {err}")
+            piv_projection_queue[queue_number].put(merged_wrapped_proj)
+            projections_to_process[queue_number].get()
+        else:
+            piv_projection_queue[queue_number].put(wrapped_z_p_1)
 
-                    if piv_projection_queue[queue_number].qsize() < 2:
-                        continue
-                    m_1 = piv_projection_queue[queue_number].get().projections["Z"]
-                    # to compare projections in a consecutive way,
-                    # we have to leave the last projection in the piv_projection_queue
-                    m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
-                    # crop images according to user selection
-                    try:
-                        if shared_state.crop_mask_coordinates[queue_number]:
-                            min_coords, max_coords = shared_state.crop_mask_coordinates[queue_number]
-                            m_1 = m_1[min_coords[0]:max_coords[0], min_coords[1]:max_coords[1]]
-                            m_2 = m_2[min_coords[0]:max_coords[0], min_coords[1]:max_coords[1]]
-                            logging_broadcast(f"piv run with crop mask for specimen {queue_number},"
-                                              f" coordinates min {min_coords[0], min_coords[1]}, "
-                                              f"max {max_coords[0], max_coords[1]}")
-                    except Exception as err:
-                        logging_broadcast(f"crop mask resulted in error: {err}")
-                    # correct planes drift:
-                    if fix_drift:
-                        logging_broadcast(f"start drift correction")
-                        m_1_copy = m_1.copy()
-                        m_2_copy = m_2.copy()
-                        # Check if shapes are appropriate for cropping
-                        if (m_1.shape[0] <= 2 * crop_margin) or (m_1.shape[1] <= 2 * crop_margin) or \
-                                (m_2.shape[0] <= 2 * crop_margin) or (m_2.shape[1] <= 2 * crop_margin):
-                            logging_broadcast(f"Image dimensions are too small for the specified crop margin."
-                                              f" image 1 shape {m_1.shape}, image 2 shape {m_2.shape}, selected margin"
-                                              f" crop value {crop_margin}")
-                        else:
-                            try:
-                                translation_model = register_translation_nd(m_1, m_2)
-                                m_1 = m_1[crop_margin:-crop_margin, crop_margin:-crop_margin]
-                                corrected_m_2 = scipy_shift(m_2, translation_model.shift_vector)
-                                m_2 = corrected_m_2[crop_margin:-crop_margin, crop_margin:-crop_margin]
-                            except Exception as err:
-                                logging_broadcast(f"drift correction wasn't successful, {err}")
-                                m_1 = m_1_copy
-                                m_2 = m_2_copy
-                    if m_1.shape == m_2.shape:
-                        try:
-                            start_piv = time.time()
-                            avg_speed = jl.fn(m_1, m_2)
-                            logging_broadcast(f"piv run took {time.time() - start_piv}")
-                            if isinstance(avg_speed[-1], float) or isinstance(avg_speed[-1], int):
-                                avg_speed = round(avg_speed[-1], 3)
-                            else:
-                                logging_broadcast(f"quickPIV returned abnormal value {avg_speed[-1]} "
-                                                  f"for specimen #{queue_number}, "
-                                                  f"frame #{ts_dict[queue_number].t + 1}")
-                        except Exception as error:
-                            raise error
-                        ts_dict[queue_number].t += 1
-                        ts_dict[queue_number].x.append(ts_dict[queue_number].t)
-                        # we add default value which might be changed after find_peaks step
-                        ts_dict[queue_number].peak.append(False)
-                        try:
-                            ts_dict[queue_number].y.append(avg_speed)
-                        except Exception as error:
-                            logging_broadcast(f"failed to update time-series list: {error}")
-                        if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
-                            ts_dict[queue_number].x = ts_dict[queue_number].x[-PLT_WIDGET_X_AXIS_LENGTH::]
-                            ts_dict[queue_number].y = ts_dict[queue_number].y[-PLT_WIDGET_X_AXIS_LENGTH::]
-                        try:
-                            peaks, _ = find_peaks(np.asarray(ts_dict[queue_number].y), prominence=1.5)
-                        except Exception as error:
-                            raise error
-                        x_marker, y_marker = [], []
-                        if len(peaks):
-                            try:
-                                peaks = peaks.tolist()
-                                x_marker = [ts_dict[queue_number].x[i] for i in peaks]
-                                y_marker = [ts_dict[queue_number].y[i] for i in peaks]
-                                if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
-                                    global_peaks_indices = [x + ts_dict[queue_number].t - PLT_WIDGET_X_AXIS_LENGTH
-                                                            + 1 for x in x_marker]
-                                else:
-                                    global_peaks_indices = x_marker
-                                for frame in global_peaks_indices:
-                                    if frame not in migration_event_frame:
-                                        migration_event_frame.add(frame)
-                            except Exception as error:
-                                raise error
-
-                        writer.writerow([ts_dict[queue_number].t,
-                                         queue_number,
-                                         avg_speed,
-                                         False])
-                        file.flush()
-                        shared_state.quick_piv_output_queue.put(
-                            (queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
-                        logging_broadcast(f"plane from queue #{queue_number} was processed")
+        if piv_projection_queue[queue_number].qsize() < 2:
+            continue
+        m_1 = piv_projection_queue[queue_number].get().projections["Z"]
+        # to compare projections in a consecutive way,
+        # we have to leave the last projection in the piv_projection_queue
+        m_2 = piv_projection_queue[queue_number].queue[0].projections["Z"]
+        # crop images according to user selection
+        try:
+            if shared_state.crop_mask_coordinates[queue_number]:
+                min_coords, max_coords = shared_state.crop_mask_coordinates[queue_number]
+                m_1 = m_1[min_coords[0]:max_coords[0], min_coords[1]:max_coords[1]]
+                m_2 = m_2[min_coords[0]:max_coords[0], min_coords[1]:max_coords[1]]
+                logging_broadcast(f"piv run with crop mask for specimen {queue_number},"
+                                  f" coordinates min {min_coords[0], min_coords[1]}, "
+                                  f"max {max_coords[0], max_coords[1]}")
+        except Exception as err:
+            logging_broadcast(f"crop mask resulted in error: {err}")
+        # correct planes drift:
+        # if fix_drift:
+        #     logging_broadcast(f"start drift correction")
+        #     start_time_drift = time.time()
+        #     m_1_copy = m_1.copy()
+        #     m_2_copy = m_2.copy()
+        #     # Check if shapes are appropriate for cropping
+        #     if (m_1.shape[0] <= 2 * crop_margin) or (m_1.shape[1] <= 2 * crop_margin) or \
+        #             (m_2.shape[0] <= 2 * crop_margin) or (m_2.shape[1] <= 2 * crop_margin):
+        #         logging_broadcast(f"Image dimensions are too small for the specified crop margin."
+        #                           f" image 1 shape {m_1.shape}, image 2 shape {m_2.shape}, selected margin"
+        #                           f" crop value {crop_margin}")
+        #     else:
+        #         try:
+        #             translation_model = register_translation_nd(m_1, m_2)
+        #             m_1 = m_1[crop_margin:-crop_margin, crop_margin:-crop_margin]
+        #             corrected_m_2 = scipy_shift(m_2, translation_model.shift_vector)
+        #             m_2 = corrected_m_2[crop_margin:-crop_margin, crop_margin:-crop_margin]
+        #         except Exception as err:
+        #             logging_broadcast(f"drift correction wasn't successful, {err}")
+        #             m_1 = m_1_copy
+        #             m_2 = m_2_copy
+        #     logging_broadcast(f"drift took {time.time() - start_time_drift}")
+        if m_1.shape == m_2.shape:
+            try:
+                start_piv = time.time()
+                avg_speed = None
+                parent_conn.send((m_1, m_2))
+                if parent_conn.poll():
+                    avg_speed = parent_conn.recv()
+                logging_broadcast(f"value from piv run took {time.time() - start_piv}")
+                if not isinstance(avg_speed, float) or isinstance(avg_speed, int):
+                    logging_broadcast(f"abnormal value of quickPIV: {avg_speed}")
+            except Exception as error:
+                raise error
+            ts_dict[queue_number].t += 1
+            ts_dict[queue_number].x.append(ts_dict[queue_number].t)
+            # we add default value which might be changed after find_peaks step
+            ts_dict[queue_number].peak.append(False)
+            try:
+                ts_dict[queue_number].y.append(avg_speed)
+            except Exception as error:
+                logging_broadcast(f"failed to update time-series list: {error}")
+            if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
+                ts_dict[queue_number].x = ts_dict[queue_number].x[-PLT_WIDGET_X_AXIS_LENGTH::]
+                ts_dict[queue_number].y = ts_dict[queue_number].y[-PLT_WIDGET_X_AXIS_LENGTH::]
+            try:
+                peaks, _ = find_peaks(np.asarray(ts_dict[queue_number].y), prominence=1.5)
+                peaks = []
+            except Exception as error:
+                raise error
+            x_marker, y_marker = [], []
+            if len(peaks):
+                try:
+                    peaks = peaks.tolist()
+                    x_marker = [ts_dict[queue_number].x[i] for i in peaks]
+                    y_marker = [ts_dict[queue_number].y[i] for i in peaks]
+                    if len(ts_dict[queue_number].x) > PLT_WIDGET_X_AXIS_LENGTH:
+                        global_peaks_indices = [x + ts_dict[queue_number].t - PLT_WIDGET_X_AXIS_LENGTH
+                                                + 1 for x in x_marker]
                     else:
-                        raise ValueError("Projections should have the same size for QuickPIV input")
-                logging_broadcast(f"for specimen #{queue_number} run took {time.time() - start_time}")
-            time.sleep(0.1)
+                        global_peaks_indices = x_marker
+                    for frame in global_peaks_indices:
+                        if frame not in migration_event_frame:
+                            migration_event_frame.add(frame)
+                except Exception as error:
+                    raise error
+
+            # writer.writerow([ts_dict[queue_number].t,
+            #                  queue_number,
+            #                  avg_speed,
+            #                  False])
+            # file.flush()
+            shared_state.quick_piv_output_queue.put(
+                (queue_number, ts_dict[queue_number].x, ts_dict[queue_number].y, x_marker, y_marker))
+            logging_broadcast(f"plane from queue #{queue_number} was processed")
+        else:
+            raise ValueError("Projections should have the same size for QuickPIV input")
+        logging_broadcast(f"for specimen #{queue_number} run took {time.time() - start_time}")
 
 
 def update_avg_speed_plot_windows(shared_state: TimelapseSharedState):
-    # global PIV_OUTPUT
-    if shared_state.quick_piv_output_queue.qsize() > 0:
-        index, x, y, x_marker, y_marker = shared_state.quick_piv_output_queue.get()
-        try:
+    try:
+        if shared_state.quick_piv_output_queue.qsize() > 0:
+            index, x, y, x_marker, y_marker = shared_state.quick_piv_output_queue.get()
             PLT_WIDGETS_DICT[index].plot_curve(x, y, x_marker, y_marker)
-        except KeyError:
-            logging_broadcast(f"window with index {index} doesn't exist")
+    except KeyError:
+        logging_broadcast(f"window with index {index} doesn't exist")
+    except (EOFError, BrokenPipeError):
+        logging_broadcast("quick_piv_output_queue is closed or inaccessible.")
 
 
 def update_plotting_windows(shared_state: TimelapseSharedState):
