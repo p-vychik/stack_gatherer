@@ -140,16 +140,16 @@ class PlottingWindow(QMainWindow, Ui_MainWindow):
 class TimelapseSharedState:
     def __init__(self, manager, args):
         self.args = args
-        self.crop_mask_coordinates = dict()
-        self.json_config = dict()
+        self.crop_mask_coordinates = {}
+        self.json_config = {}
         self.maxprojection_queue = Queue() if args.pivjl else None  # we use it only for quickPIV
         self.migration_detected = Queue()
         self.avg_speed_data = list()
         self.active_stacks = {}
-        self.currently_saving_stacks_dict = dict()
+        self.currently_saving_stacks_dict = {}
         self.currently_saving_stacks_lock = multiprocessing.Lock()
         self.exit_gracefully = multiprocessing.Event()
-        self.napari_layers_to_show_queue = Queue()
+        self.napari_layers_to_show_queue = OrderedLayersQueue(self.exit_gracefully)
         self.quick_piv_output_queue = Queue()
         self.projections_to_napari_dict = OrderedDict()
         self.shown_napari_layers_dict = OrderedDict()
@@ -159,6 +159,8 @@ class TimelapseSharedState:
         self.temp_dir = ""
         self.pivjl_script_path = ""
         self.restart_timelapse_json = self.args.restart if self.args.restart else ""
+        self.napari_viewer_lock = threading.Lock()
+        self.last_napari_layer = {}
 
     def update_piv_queues(self, manager):
         if self.maxprojection_queue.qsize() == 0:
@@ -189,6 +191,66 @@ class TimelapseSharedState:
 
 class NotImagePlaneFile(Exception):
     pass
+
+
+class OrderedLayersQueue:
+    def __init__(self, exit_event: multiprocessing.Event):
+        self.queue = Queue()
+        self.sorting_queue = Queue()
+        self.last_time_point = {}
+        self.lock = threading.Lock()
+        self.exit_event = exit_event
+        self.thread = Thread(target=self._order_time_points, args=(), daemon=True)
+        self.thread.start()
+
+    def put(self, plane_dict):
+        self.sorting_queue.put(plane_dict)
+
+    def get(self):
+        try:
+            with self.lock:
+                return self.queue.get(timeout=1)
+        except queue.Empty:
+            return None
+
+    def qsize(self):
+        return self.queue.qsize()
+
+    def _order_time_points(self):
+        while not self.exit_event.is_set():
+            try:
+                time.sleep(0.05)
+                plane_dict = self.sorting_queue.get(timeout=1)
+                key, _ = next(iter(plane_dict.items()))
+                specimen = key.split("SPC_")[1].split("_")[0]
+                time_point = int(key.split("TP_")[1].split("_")[0])
+                if specimen not in self.last_time_point and time_point == 0:
+                    self.last_time_point[specimen] = 0
+                    with self.lock:
+                        self.queue.put(plane_dict)
+                    continue
+                if specimen not in self.last_time_point:
+                    logging_broadcast("Planes time points numeration should start with zero")
+                    continue
+                if self.sorting_queue.qsize() > 50:
+                    # if problems with data supply occur some time points may be lost which would lead
+                    # to the queue overflow. In that case - use less strict criteria to empty queue
+                    logging_broadcast(f"sorting queue overflow, queue size: {self.sorting_queue.qsize()}")
+                    if time_point > self.last_time_point[specimen]:
+                        with self.lock:
+                            self.queue.put(plane_dict)
+                        self.last_time_point[specimen] = time_point
+                        continue
+                if time_point - self.last_time_point[specimen] == 1:
+                    with self.lock:
+                        self.queue.put(plane_dict)
+                    self.last_time_point[specimen] = time_point
+                else:
+                    self.sorting_queue.put(plane_dict)
+            except queue.Empty:
+                continue
+            except Exception as error:
+                logging_broadcast(f"Exception in _order_time_points: {error}")
 
 
 class InputFilesQueue:
@@ -563,7 +625,7 @@ def collect_files_to_one_stack_get_axial_projections(shared_state: TimelapseShar
             if shared_state.maxprojection_queue is not None:
                 # should add this option to check
                 # if stack_signature.specimen in shared_state.maxprojection_queue:
-                    # shared_state.maxprojection_queue[stack_signature.specimen].put(wrapped_z_projection)
+                # shared_state.maxprojection_queue[stack_signature.specimen].put(wrapped_z_projection)
                 shared_state.maxprojection_queue.put(wrapped_z_projection)
                 # else:
                 #     logging_broadcast(f"Specimen signature not found in shared queue, signature: {stack_signature}")
@@ -790,47 +852,54 @@ def on_rectangle_selection(shapes_layer, event, shared_state: TimelapseSharedSta
 
 
 def update_napari_viewer_layer(shared_state: TimelapseSharedState, napari_viewer) -> None:
-    if shared_state.napari_layers_to_show_queue.qsize() > 0:
+    with shared_state.napari_viewer_lock:
+        if shared_state.napari_layers_to_show_queue.qsize() == 0:
+            return
         data_input = shared_state.napari_layers_to_show_queue.get()
         for axes_names, image in data_input.items():
-            match = re.search(r'TP_(\d+)', axes_names)
-            if match:
-                time_point = int(match.group(1))
-                drawn_layer_key = re.sub(r'TP_\d+', f'TP_{time_point - 1}', axes_names)
+            match = re.search(r'SPC_(\d+)_', axes_names)
+            if not match:
+                continue
+            specimen = match.group(0)
+            last_layer_name = ""
+            mask = re.sub(r'TP_\d+_', "", axes_names)
+            crop_mask_name = f"Crop mask {mask}"
+            if specimen in shared_state.last_napari_layer:
+                last_layer_name = shared_state.last_napari_layer[specimen]
+            if last_layer_name in napari_viewer.layers:
+                layer_image = napari_viewer.layers[last_layer_name]
+                layer_image.data = image
+                layer_image.name = axes_names
+                shared_state.last_napari_layer[specimen] = axes_names
 
-                if drawn_layer_key not in napari_viewer.layers:
-                    # Add a new layer if it doesn't exist
-                    layer_image = napari_viewer.add_image(image, name=axes_names)
-                    mask_name = re.sub(r'TP_\d+_', "", axes_names)
-                    shape_layer = napari_viewer.add_shapes(name=f"Crop mask {mask_name}", shape_type='rectangle')
+                if crop_mask_name not in napari_viewer.layers and shared_state.args.pivjl:
+                    shape_layer = napari_viewer.add_shapes(name=crop_mask_name,
+                                                           shape_type='rectangle')
                     # track changes on shape_layer
                     shape_layer.mouse_drag_callbacks.append(lambda layer, event:
                                                             on_rectangle_selection(layer,
                                                                                    event,
-                                                                                   shared_state)
-                                                            )
-
-                else:
-                    # Retrieve the existing layer
-                    layer_image = napari_viewer.layers[drawn_layer_key]
-
-                    # Check if there is an existing selection
-                    existing_selection = None
-                    if hasattr(layer_image, 'selected_data') and len(layer_image.selected_data) > 0:
+                                                                                   shared_state))
+                if shared_state.args.pivjl and hasattr(layer_image, 'selected_data'):
+                    if len(layer_image.selected_data) > 0:
                         existing_selection = layer_image.selected_data[0]
-
-                    # Update the layer data and rename it
-                    layer_image.data = image
-                    layer_image.name = axes_names
-
-                    # Restore the previous selection if it exists
-                    if existing_selection:
                         layer_image.selected_data = [existing_selection]
-                # Adjust contrast limits if necessary
-                if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
-                    napari_viewer.layers[axes_names].reset_contrast_limits()
-                if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
-                    napari_viewer.layers[axes_names].reset_contrast_limits()
+            else:
+                layer_image = napari_viewer.add_image(image, name=axes_names)
+                shared_state.last_napari_layer[specimen] = axes_names
+                if shared_state.args.pivjl and crop_mask_name not in napari_viewer.layers:
+                    shape_layer = napari_viewer.add_shapes(name=crop_mask_name,
+                                                           shape_type='rectangle')
+                    # track changes on shape_layer
+                    shape_layer.mouse_drag_callbacks.append(lambda layer, event:
+                                                            on_rectangle_selection(layer,
+                                                                                   event,
+                                                                                   shared_state))
+            # Adjust contrast limits if necessary
+            if image.dtype == np.dtype('uint16') and layer_image.contrast_limits[-1] <= 255:
+                napari_viewer.layers[axes_names].reset_contrast_limits()
+            if image.dtype == np.dtype('uint8') and layer_image.contrast_limits[-1] > 255:
+                napari_viewer.layers[axes_names].reset_contrast_limits()
         visible_specimens = set()
         for layer in napari_viewer.layers:
             specimen_index = parse_specimen_index(layer.name)
@@ -1123,12 +1192,12 @@ def run_the_loop(kwargs, shared_state: TimelapseSharedState, manager: Manager):
                         logging_broadcast(err)
             piv_process = Thread(target=run_piv_process,
                                  args=(shared_state,
-                                      process_z_projections,
-                                      output_dir,
-                                      fix_drift,
-                                      crop_margin
-                                      ),
-                                name='piv_run', daemon=True)
+                                       process_z_projections,
+                                       output_dir,
+                                       fix_drift,
+                                       crop_margin
+                                       ),
+                                 name='piv_run', daemon=True)
             piv_process.start()
             # mode to process only max projections
             if process_z_projections:
@@ -1418,7 +1487,6 @@ def run_piv_process(shared_state: TimelapseSharedState,
                     fix_drift: bool,
                     crop_margin: int,
                     ):
-
     parent_conn, child_conn = Pipe()
 
     # Start the child process, passing child_conn
@@ -1496,39 +1564,40 @@ def run_piv_process(shared_state: TimelapseSharedState,
                                   f"max {max_coords[0], max_coords[1]}")
         except Exception as err:
             logging_broadcast(f"crop mask resulted in error: {err}")
-        # correct planes drift:
-        # if fix_drift:
-        #     logging_broadcast(f"start drift correction")
-        #     start_time_drift = time.time()
-        #     m_1_copy = m_1.copy()
-        #     m_2_copy = m_2.copy()
-        #     # Check if shapes are appropriate for cropping
-        #     if (m_1.shape[0] <= 2 * crop_margin) or (m_1.shape[1] <= 2 * crop_margin) or \
-        #             (m_2.shape[0] <= 2 * crop_margin) or (m_2.shape[1] <= 2 * crop_margin):
-        #         logging_broadcast(f"Image dimensions are too small for the specified crop margin."
-        #                           f" image 1 shape {m_1.shape}, image 2 shape {m_2.shape}, selected margin"
-        #                           f" crop value {crop_margin}")
-        #     else:
-        #         try:
-        #             translation_model = register_translation_nd(m_1, m_2)
-        #             m_1 = m_1[crop_margin:-crop_margin, crop_margin:-crop_margin]
-        #             corrected_m_2 = scipy_shift(m_2, translation_model.shift_vector)
-        #             m_2 = corrected_m_2[crop_margin:-crop_margin, crop_margin:-crop_margin]
-        #         except Exception as err:
-        #             logging_broadcast(f"drift correction wasn't successful, {err}")
-        #             m_1 = m_1_copy
-        #             m_2 = m_2_copy
-        #     logging_broadcast(f"drift took {time.time() - start_time_drift}")
+        # correct planes drift
+        if fix_drift:
+            logging_broadcast(f"start drift correction")
+            start_time_drift = time.time()
+            m_1_copy = m_1.copy()
+            m_2_copy = m_2.copy()
+            # Check if shapes are appropriate for cropping
+            if (m_1.shape[0] <= 2 * crop_margin) or (m_1.shape[1] <= 2 * crop_margin) or \
+                    (m_2.shape[0] <= 2 * crop_margin) or (m_2.shape[1] <= 2 * crop_margin):
+                logging_broadcast(f"Image dimensions are too small for the specified crop margin."
+                                  f" image 1 shape {m_1.shape}, image 2 shape {m_2.shape}, selected margin"
+                                  f" crop value {crop_margin}")
+            else:
+                try:
+                    translation_model = register_translation_nd(m_1, m_2)
+                    m_1 = m_1[crop_margin:-crop_margin, crop_margin:-crop_margin]
+                    corrected_m_2 = scipy_shift(m_2, translation_model.shift_vector)
+                    m_2 = corrected_m_2[crop_margin:-crop_margin, crop_margin:-crop_margin]
+                except Exception as err:
+                    logging_broadcast(f"drift correction wasn't successful, {err}")
+                    m_1 = m_1_copy
+                    m_2 = m_2_copy
+            logging_broadcast(f"drift took {time.time() - start_time_drift}")
         if m_1.shape == m_2.shape:
             try:
                 start_piv = time.time()
-                avg_speed = None
                 parent_conn.send((m_1, m_2))
-                if parent_conn.poll():
-                    avg_speed = parent_conn.recv()
+                while not parent_conn.poll():
+                    time.sleep(0.01)
+                avg_speed = parent_conn.recv()
                 logging_broadcast(f"value from piv run took {time.time() - start_piv}")
                 if not isinstance(avg_speed, float) or isinstance(avg_speed, int):
                     logging_broadcast(f"abnormal value of quickPIV: {avg_speed}")
+                    continue
             except Exception as error:
                 raise error
             ts_dict[queue_number].t += 1
@@ -1802,7 +1871,7 @@ def main():
     timer1.start(25)
     timer2 = QTimer()
     timer2.timeout.connect(lambda: update_napari_viewer_layer(shared_state, napari_viewer))
-    timer2.start(10)
+    timer2.start(100)
     plotting_windows_timer.timeout.connect(lambda: update_plotting_windows(shared_state))
     plotting_windows_timer.start(1000)
     timer4 = QTimer()
